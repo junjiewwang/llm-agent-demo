@@ -1,0 +1,21 @@
+公司简介
+
+星辰科技有限公司成立于2020年，总部位于深圳市南山区。公司主要从事人工智能和大数据相关的技术研发与服务。
+
+核心产品包括：
+1. StarChat - 企业级智能对话平台，支持多轮对话和知识库问答
+2. DataStar - 大数据分析平台，提供实时数据处理和可视化
+3. AIFlow - 机器学习模型训练和部署平台
+
+公司目前拥有员工约500人，研发团队占比60%。2025年营收达到3亿元人民币。
+
+技术栈：
+- 后端：Python, Go, Java
+- 前端：React, Vue
+- AI框架：PyTorch, TensorFlow
+- 数据库：PostgreSQL, Redis, Elasticsearch
+
+联系方式：
+- 官网：www.starchentech.com
+- 邮箱：contact@starchentech.com
+- 电话：0755-12345678
