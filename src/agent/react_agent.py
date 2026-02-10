@@ -19,7 +19,8 @@ import json
 import time
 from typing import Optional, TYPE_CHECKING
 
-from src.agent.base_agent import BaseAgent
+from src.agent.base_agent import BaseAgent, OnEventCallback
+from src.agent.events import AgentEvent, AgentStoppedError, EventType
 from src.agent.loop_detector import LoopDetector
 from src.agent.metrics import RunMetrics
 from src.config import settings
@@ -75,11 +76,36 @@ class ReActAgent(BaseAgent):
         """获取最近一次 run() 的运行指标。"""
         return self._last_metrics
 
-    def run(self, user_input: str) -> str:
-        """处理用户输入，执行 ReAct 循环直到得到最终回答。"""
+    def run(self, user_input: str, on_event: OnEventCallback = None) -> str:
+        """处理用户输入，执行 ReAct 循环直到得到最终回答。
+
+        如果外部通过 on_event 回调抛出 AgentStoppedError，
+        将在迭代间的安全点中断，执行清理后重新抛出。
+        """
         metrics = RunMetrics(max_iterations=self._max_iterations)
         self._loop_detector.reset()
 
+        def _emit(event: AgentEvent) -> None:
+            """安全地发送事件。AgentStoppedError 不被吞掉，直接向上传播。"""
+            if on_event:
+                try:
+                    on_event(event)
+                except AgentStoppedError:
+                    raise
+                except Exception as e:
+                    logger.warning("事件回调异常: {}", e)
+
+        try:
+            return self._run_loop(user_input, metrics, _emit, on_event is not None)
+        except AgentStoppedError:
+            logger.info("用户停止了 Agent 运行 | 迭代: {}", metrics.iterations)
+            self._context_builder.clear_injections()
+            metrics.finish()
+            self._last_metrics = metrics
+            raise
+
+    def _run_loop(self, user_input: str, metrics: RunMetrics, _emit, has_callback: bool) -> str:
+        """ReAct 核心循环，从 run() 中分离以便统一异常处理。"""
         # 1. 检索知识库，通过 ContextBuilder 临时注入（不写入 ConversationMemory）
         self._inject_knowledge(user_input, metrics)
         # 2. 检索长期记忆，通过 ContextBuilder 临时注入
@@ -93,6 +119,12 @@ class ReActAgent(BaseAgent):
         for iteration in range(1, self._max_iterations + 1):
             metrics.iterations = iteration
             logger.info("ReAct 迭代 [{}/{}]", iteration, self._max_iterations)
+
+            _emit(AgentEvent(
+                type=EventType.THINKING,
+                iteration=iteration,
+                max_iterations=self._max_iterations,
+            ))
 
             # 通过 ContextBuilder 组装完整上下文（System + Inject + History）
             context_messages = self._context_builder.build(self._memory.messages)
@@ -109,6 +141,13 @@ class ReActAgent(BaseAgent):
             if not response.tool_calls:
                 self._memory.add_assistant_message(response)
                 logger.info("Agent 给出最终回答")
+
+                _emit(AgentEvent(
+                    type=EventType.ANSWERING,
+                    iteration=iteration,
+                    max_iterations=self._max_iterations,
+                ))
+
                 self._store_to_long_term_memory(user_input, response.content or "")
                 self._context_builder.clear_injections()
                 metrics.finish()
@@ -118,7 +157,7 @@ class ReActAgent(BaseAgent):
 
             # 情况2: LLM 决定调用工具
             self._memory.add_assistant_message(response)
-            self._execute_tool_calls(response.tool_calls, metrics)
+            self._execute_tool_calls(response.tool_calls, metrics, _emit)
 
             # 循环检测：如果检测到重复调用模式，插入引导 prompt
             loop_hint = self._loop_detector.get_loop_summary()
@@ -132,6 +171,13 @@ class ReActAgent(BaseAgent):
         # 达到最大迭代次数，强制让 LLM 总结
         metrics.hit_max_iterations = True
         logger.warning("达到最大迭代次数 {}，强制总结", self._max_iterations)
+
+        _emit(AgentEvent(
+            type=EventType.MAX_ITERATIONS,
+            iteration=self._max_iterations,
+            max_iterations=self._max_iterations,
+        ))
+
         answer = self._force_final_answer()
         self._store_to_long_term_memory(user_input, answer)
         self._context_builder.clear_injections()
@@ -239,7 +285,7 @@ class ReActAgent(BaseAgent):
             logger.warning("关键事实提取失败: {}", e)
             return None
 
-    def _execute_tool_calls(self, tool_calls, metrics: RunMetrics):
+    def _execute_tool_calls(self, tool_calls, metrics: RunMetrics, emit=None):
         """执行 LLM 请求的所有工具调用。"""
         for tc in tool_calls:
             func_name = tc["function"]["name"]
@@ -257,12 +303,31 @@ class ReActAgent(BaseAgent):
                 self._memory.add_tool_result(tool_call_id, func_name, error_msg)
                 metrics.record_tool_call(func_name, success=False, duration_ms=0, error=str(e))
                 self._loop_detector.record(func_name, func_args_str)
+                if emit:
+                    emit(AgentEvent(
+                        type=EventType.TOOL_RESULT,
+                        tool_name=func_name,
+                        tool_args=func_args if isinstance(func_args, dict) else {},
+                        tool_result_preview=error_msg[:100],
+                        success=False,
+                        message=error_msg,
+                    ))
                 continue
+
+            # 发送工具调用事件
+            if emit:
+                emit(AgentEvent(
+                    type=EventType.TOOL_CALL,
+                    iteration=metrics.iterations,
+                    max_iterations=metrics.max_iterations,
+                    tool_name=func_name,
+                    tool_args=func_args,
+                ))
 
             # 执行工具并计时（ToolRegistry 返回 ToolResult）
             start = time.monotonic()
             result = self._tools.execute(func_name, **func_args)
-            duration_ms = (time.monotonic() - start) * 1000
+            duration_ms = int((time.monotonic() - start) * 1000)
 
             metrics.record_tool_call(
                 func_name,
@@ -281,6 +346,19 @@ class ReActAgent(BaseAgent):
                         func_name, duration_ms, truncated_info, message_content[:200])
 
             self._memory.add_tool_result(tool_call_id, func_name, message_content)
+
+            # 发送工具结果事件
+            if emit:
+                emit(AgentEvent(
+                    type=EventType.TOOL_RESULT,
+                    iteration=metrics.iterations,
+                    max_iterations=metrics.max_iterations,
+                    tool_name=func_name,
+                    tool_args=func_args,
+                    tool_result_preview=message_content[:150],
+                    duration_ms=duration_ms,
+                    success=result.success,
+                ))
 
     def _force_final_answer(self) -> str:
         """强制 LLM 基于当前上下文给出最终回答（不再调用工具）。"""
