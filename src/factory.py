@@ -21,6 +21,8 @@ from src.rag import KnowledgeBase
 from src.tools import (
     ToolRegistry, CalculatorTool, DateTimeTool, WebSearchTool, KnowledgeSearchTool,
 )
+from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
+from src.config import settings
 from src.utils.logger import logger
 
 SYSTEM_PROMPT = """你是一个智能助手，能够自主思考和使用工具来帮助用户解决各种问题。
@@ -114,6 +116,24 @@ def create_tool_registry(knowledge_base: Optional[KnowledgeBase]) -> ToolRegistr
     registry.register(DateTimeTool())
     registry.register(WebSearchTool())
     registry.register(KnowledgeSearchTool(knowledge_base=knowledge_base))
+
+    # 文件系统工具：共享同一个 Sandbox 实例
+    fs_config = settings.filesystem
+    exclude = [p.strip() for p in fs_config.exclude.split(",") if p.strip()]
+    allowed_dirs = [p.strip() for p in fs_config.allowed_dirs.split(",") if p.strip()] or None
+    writable_dirs = [p.strip() for p in fs_config.writable_dirs.split(",") if p.strip()] or None
+    sandbox = Sandbox(
+        root=fs_config.sandbox_dir or None,
+        allowed_dirs=allowed_dirs,
+        writable_dirs=writable_dirs,
+        exclude_patterns=exclude or None,
+        max_file_size=fs_config.max_file_size,
+        max_depth=fs_config.max_depth,
+        max_results=fs_config.max_results,
+    )
+    registry.register(FileReaderTool(sandbox))
+    registry.register(FileWriterTool(sandbox))
+
     return registry
 
 
@@ -194,6 +214,62 @@ def create_conversation(
     tenant.conversations[conv_id] = conv
     tenant.active_conv_id = conv_id
     logger.info("新建对话 {} (租户 {})", conv_id, tenant.tenant_id[:8])
+    return conv
+
+
+def restore_conversation(
+    shared: SharedComponents,
+    tenant: TenantSession,
+    conv_data: dict,
+    max_memory_tokens: int = 8000,
+) -> Conversation:
+    """从持久化数据恢复一个对话。
+
+    Args:
+        shared: 全局共享组件。
+        tenant: 所属租户会话。
+        conv_data: 序列化的对话数据，包含：
+            id, title, created_at, chat_history, memory_messages, system_prompt_count
+    """
+    conv_id = conv_data["id"]
+
+    # 重建 ConversationMemory：先创建空实例，再从持久化数据恢复
+    memory = ConversationMemory(
+        system_prompt=None,  # 不设 system prompt，由 restore_from 恢复
+        max_tokens=max_memory_tokens,
+        model=shared.llm_client.model,
+    )
+    memory.set_llm_client(shared.llm_client)
+
+    # 恢复消息记录
+    memory_data = {
+        "messages": conv_data.get("memory_messages", []),
+        "system_prompt_count": conv_data.get("system_prompt_count", 0),
+    }
+    memory.restore_from(memory_data)
+
+    context_builder = ContextBuilder()
+
+    agent = ReActAgent(
+        llm_client=shared.llm_client,
+        tool_registry=shared.tool_registry,
+        memory=memory,
+        context_builder=context_builder,
+        vector_store=tenant.vector_store,
+        knowledge_base=shared.knowledge_base,
+    )
+
+    conv = Conversation(
+        id=conv_id,
+        title=conv_data.get("title", "恢复的对话"),
+        memory=memory,
+        agent=agent,
+        created_at=conv_data.get("created_at", time.time()),
+        chat_history=conv_data.get("chat_history", []),
+    )
+
+    tenant.conversations[conv_id] = conv
+    logger.info("恢复对话 {} (租户 {})", conv_id, tenant.tenant_id[:8])
     return conv
 
 
