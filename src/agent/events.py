@@ -45,3 +45,5 @@ class AgentEvent:
     duration_ms: int = 0
     success: bool = True
     message: str = ""
+    parallel_total: int = 0  # >1 表示该工具调用是并发批次的一部分，值为批次总数
+    parallel_index: int = 0  # 该工具在并发批次中的序号（从 1 开始）

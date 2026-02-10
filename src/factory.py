@@ -22,6 +22,18 @@ from src.tools import (
     ToolRegistry, CalculatorTool, DateTimeTool, WebSearchTool, KnowledgeSearchTool,
 )
 from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
+from src.tools.devops import CommandSandbox, CommandPolicy, KubectlTool, DockerTool
+from src.tools.devops.kubectl_tool import (
+    _READONLY_SUBCOMMANDS as _K8S_RO,
+    _WRITE_SUBCOMMANDS as _K8S_WR,
+    _BLOCKED_FLAGS as _K8S_BLOCKED,
+    _SENSITIVE_RESOURCES as _K8S_SENSITIVE,
+)
+from src.tools.devops.docker_tool import (
+    _READONLY_SUBCOMMANDS as _DOCKER_RO,
+    _WRITE_SUBCOMMANDS as _DOCKER_WR,
+    _BLOCKED_FLAGS as _DOCKER_BLOCKED,
+)
 from src.config import settings
 from src.utils.logger import logger
 
@@ -38,6 +50,7 @@ SYSTEM_PROMPT = """你是一个智能助手，能够自主思考和使用工具�
 3. 根据工具返回的结果，继续思考或给出最终回答
 4. 如果一个工具不够，可以连续调用多个工具
 5. 如果上下文中已有知识库或记忆内容，直接基于它们回答
+6. 当需要对多个目标执行相同类型的操作时（如查询多个 namespace 的资源、读取多个文件），请在一次回复中同时调用多个工具，而不是逐个调用
 
 请用简洁、准确的语言回答问题。"""
 
@@ -134,7 +147,63 @@ def create_tool_registry(knowledge_base: Optional[KnowledgeBase]) -> ToolRegistr
     registry.register(FileReaderTool(sandbox))
     registry.register(FileWriterTool(sandbox))
 
+    # DevOps 工具：按配置按需注册
+    _register_devops_tools(registry)
+
     return registry
+
+
+def _register_devops_tools(registry: ToolRegistry) -> None:
+    """按配置注册 DevOps 工具（kubectl / docker）。"""
+    devops_config = settings.devops
+
+    if devops_config.kubectl_enabled:
+        allowed_subs = _K8S_RO | _K8S_WR if not devops_config.kubectl_read_only else _K8S_RO
+        policy = CommandPolicy(
+            binary="kubectl",
+            allowed_subcommands=allowed_subs,
+            blocked_flags=_K8S_BLOCKED,
+            sensitive_resources=_K8S_SENSITIVE,
+            timeout=devops_config.kubectl_timeout,
+        )
+        sandbox = CommandSandbox(policy)
+        ns_list = [
+            ns.strip()
+            for ns in devops_config.kubectl_allowed_namespaces.split(",")
+            if ns.strip()
+        ] or None
+        registry.register(
+            KubectlTool(
+                sandbox=sandbox,
+                enable_write=not devops_config.kubectl_read_only,
+                allowed_namespaces=ns_list,
+            )
+        )
+        logger.info(
+            "kubectl 工具已注册 (只读={}, namespace限制={})",
+            devops_config.kubectl_read_only,
+            ns_list or "无",
+        )
+
+    if devops_config.docker_enabled:
+        allowed_subs = _DOCKER_RO | _DOCKER_WR if not devops_config.docker_read_only else _DOCKER_RO
+        policy = CommandPolicy(
+            binary="docker",
+            allowed_subcommands=allowed_subs,
+            blocked_flags=_DOCKER_BLOCKED,
+            timeout=devops_config.docker_timeout,
+        )
+        sandbox = CommandSandbox(policy)
+        registry.register(
+            DockerTool(
+                sandbox=sandbox,
+                enable_write=not devops_config.docker_read_only,
+            )
+        )
+        logger.info(
+            "docker 工具已注册 (只读={})",
+            devops_config.docker_read_only,
+        )
 
 
 def create_shared_components() -> SharedComponents:

@@ -17,6 +17,8 @@
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
 from src.agent.base_agent import BaseAgent, OnEventCallback
@@ -285,80 +287,174 @@ class ReActAgent(BaseAgent):
             logger.warning("关键事实提取失败: {}", e)
             return None
 
+    # 工具并发执行的最大线程数
+    _TOOL_MAX_WORKERS = 5
+
     def _execute_tool_calls(self, tool_calls, metrics: RunMetrics, emit=None):
-        """执行 LLM 请求的所有工具调用。"""
-        for tc in tool_calls:
-            func_name = tc["function"]["name"]
-            func_args_str = tc["function"]["arguments"]
-            tool_call_id = tc["id"]
+        """执行 LLM 请求的所有工具调用。
 
-            logger.info("调用工具: {} | 参数: {}", func_name, func_args_str)
+        单个 tool_call 时串行执行；多个 tool_call 时并发执行以减少总耗时。
+        无论并发还是串行，结果都按原始顺序写入 Memory（保证上下文一致性）。
+        """
+        if len(tool_calls) == 1:
+            self._execute_single_tool(tool_calls[0], metrics, emit)
+            return
 
-            # 解析参数
-            try:
-                func_args = json.loads(func_args_str) if func_args_str else {}
-            except json.JSONDecodeError as e:
-                error_msg = f"参数解析失败: {e}"
-                logger.error("工具参数解析失败: {} | 原始参数: {}", e, func_args_str)
-                self._memory.add_tool_result(tool_call_id, func_name, error_msg)
-                metrics.record_tool_call(func_name, success=False, duration_ms=0, error=str(e))
-                self._loop_detector.record(func_name, func_args_str)
-                if emit:
-                    emit(AgentEvent(
-                        type=EventType.TOOL_RESULT,
-                        tool_name=func_name,
-                        tool_args=func_args if isinstance(func_args, dict) else {},
-                        tool_result_preview=error_msg[:100],
-                        success=False,
-                        message=error_msg,
-                    ))
+        # 多个 tool_calls：并发执行
+        total = len(tool_calls)
+        logger.info("并发执行 {} 个工具调用", total)
+
+        # 先发送所有 TOOL_CALL 事件 + 解析参数
+        parsed: list[_ParsedToolCall | None] = []
+        for idx, tc in enumerate(tool_calls):
+            p = self._parse_and_emit_tool_call(
+                tc, metrics, emit,
+                parallel_total=total, parallel_index=idx + 1,
+            )
+            parsed.append(p)
+
+        # 并发执行所有已成功解析的工具
+        results: dict[int, _ToolExecResult] = {}
+        with ThreadPoolExecutor(max_workers=min(len(tool_calls), self._TOOL_MAX_WORKERS)) as pool:
+            future_to_idx = {}
+            for i, p in enumerate(parsed):
+                if p is not None:
+                    future = pool.submit(self._tools.execute, p.func_name, **p.func_args)
+                    future_to_idx[future] = i
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                p = parsed[idx]
+                assert p is not None
+                start_time = p.start_time
+                try:
+                    result = future.result()
+                    duration_ms = int((time.monotonic() - start_time) * 1000)
+                    results[idx] = _ToolExecResult(
+                        result=result, duration_ms=duration_ms,
+                    )
+                except Exception as e:
+                    duration_ms = int((time.monotonic() - start_time) * 1000)
+                    from src.tools.result import ToolResult
+                    results[idx] = _ToolExecResult(
+                        result=ToolResult.fail(f"工具执行异常: {e}"),
+                        duration_ms=duration_ms,
+                    )
+
+        # 按原始顺序写入 Memory 和发送事件（保证上下文一致性）
+        for i, tc in enumerate(tool_calls):
+            p = parsed[i]
+            if p is None:
+                continue  # 解析失败的已经在 _parse_and_emit_tool_call 中处理
+
+            exec_result = results.get(i)
+            if exec_result is None:
                 continue
 
-            # 发送工具调用事件
-            if emit:
-                emit(AgentEvent(
-                    type=EventType.TOOL_CALL,
-                    iteration=metrics.iterations,
-                    max_iterations=metrics.max_iterations,
-                    tool_name=func_name,
-                    tool_args=func_args,
-                ))
-
-            # 执行工具并计时（ToolRegistry 返回 ToolResult）
-            start = time.monotonic()
-            result = self._tools.execute(func_name, **func_args)
-            duration_ms = int((time.monotonic() - start) * 1000)
-
-            metrics.record_tool_call(
-                func_name,
-                success=result.success,
-                duration_ms=duration_ms,
-                error=result.error,
+            self._record_tool_result(
+                tc, p, exec_result.result, exec_result.duration_ms, metrics, emit,
+                parallel_total=total, parallel_index=i + 1,
             )
 
-            # 记录到循环检测器
+    def _execute_single_tool(self, tc, metrics: RunMetrics, emit=None):
+        """串行执行单个工具调用（原有逻辑的提取）。"""
+        p = self._parse_and_emit_tool_call(tc, metrics, emit)
+        if p is None:
+            return
+
+        result = self._tools.execute(p.func_name, **p.func_args)
+        duration_ms = int((time.monotonic() - p.start_time) * 1000)
+        self._record_tool_result(tc, p, result, duration_ms, metrics, emit)
+
+    def _parse_and_emit_tool_call(
+        self, tc, metrics: RunMetrics, emit=None,
+        parallel_total: int = 0, parallel_index: int = 0,
+    ) -> "_ParsedToolCall | None":
+        """解析工具调用参数，发送 TOOL_CALL 事件。
+
+        Returns:
+            解析成功返回 _ParsedToolCall，失败返回 None（已记录错误到 Memory）。
+        """
+        func_name = tc["function"]["name"]
+        func_args_str = tc["function"]["arguments"]
+        tool_call_id = tc["id"]
+
+        logger.info("调用工具: {} | 参数: {}", func_name, func_args_str)
+
+        try:
+            func_args = json.loads(func_args_str) if func_args_str else {}
+        except json.JSONDecodeError as e:
+            error_msg = f"参数解析失败: {e}"
+            logger.error("工具参数解析失败: {} | 原始参数: {}", e, func_args_str)
+            self._memory.add_tool_result(tool_call_id, func_name, error_msg)
+            metrics.record_tool_call(func_name, success=False, duration_ms=0, error=str(e))
             self._loop_detector.record(func_name, func_args_str)
-
-            # 生成 tool message 内容
-            message_content = result.to_message()
-            truncated_info = " (已截断)" if result.truncated else ""
-            logger.info("工具 {} 执行完成 | 耗时: {:.0f}ms{} | 结果: {}",
-                        func_name, duration_ms, truncated_info, message_content[:200])
-
-            self._memory.add_tool_result(tool_call_id, func_name, message_content)
-
-            # 发送工具结果事件
             if emit:
                 emit(AgentEvent(
                     type=EventType.TOOL_RESULT,
-                    iteration=metrics.iterations,
-                    max_iterations=metrics.max_iterations,
                     tool_name=func_name,
-                    tool_args=func_args,
-                    tool_result_preview=message_content[:150],
-                    duration_ms=duration_ms,
-                    success=result.success,
+                    tool_args={},
+                    tool_result_preview=error_msg[:100],
+                    success=False,
+                    message=error_msg,
                 ))
+            return None
+
+        if emit:
+            emit(AgentEvent(
+                type=EventType.TOOL_CALL,
+                iteration=metrics.iterations,
+                max_iterations=metrics.max_iterations,
+                tool_name=func_name,
+                tool_args=func_args,
+                parallel_total=parallel_total,
+                parallel_index=parallel_index,
+            ))
+
+        return _ParsedToolCall(
+            func_name=func_name,
+            func_args=func_args,
+            func_args_str=func_args_str,
+            start_time=time.monotonic(),
+        )
+
+    def _record_tool_result(
+        self, tc, parsed: "_ParsedToolCall", result, duration_ms: int,
+        metrics: RunMetrics, emit=None,
+        parallel_total: int = 0, parallel_index: int = 0,
+    ) -> None:
+        """记录工具执行结果到 Memory、Metrics、LoopDetector，并发送事件。"""
+        tool_call_id = tc["id"]
+
+        metrics.record_tool_call(
+            parsed.func_name,
+            success=result.success,
+            duration_ms=duration_ms,
+            error=result.error,
+        )
+
+        self._loop_detector.record(parsed.func_name, parsed.func_args_str)
+
+        message_content = result.to_message()
+        truncated_info = " (已截断)" if result.truncated else ""
+        logger.info("工具 {} 执行完成 | 耗时: {:.0f}ms{} | 结果: {}",
+                    parsed.func_name, duration_ms, truncated_info, message_content[:200])
+
+        self._memory.add_tool_result(tool_call_id, parsed.func_name, message_content)
+
+        if emit:
+            emit(AgentEvent(
+                type=EventType.TOOL_RESULT,
+                iteration=metrics.iterations,
+                max_iterations=metrics.max_iterations,
+                tool_name=parsed.func_name,
+                tool_args=parsed.func_args,
+                tool_result_preview=message_content[:150],
+                duration_ms=duration_ms,
+                success=result.success,
+                parallel_total=parallel_total,
+                parallel_index=parallel_index,
+            ))
 
     def _force_final_answer(self) -> str:
         """强制 LLM 基于当前上下文给出最终回答（不再调用工具）。"""
@@ -374,3 +470,19 @@ class ReActAgent(BaseAgent):
         )
         self._memory.add_assistant_message(response)
         return response.content or "抱歉，我无法得出结论。"
+
+
+@dataclass
+class _ParsedToolCall:
+    """工具调用解析结果（内部使用）。"""
+    func_name: str
+    func_args: dict
+    func_args_str: str
+    start_time: float
+
+
+@dataclass
+class _ToolExecResult:
+    """工具执行结果包装（内部使用）。"""
+    result: object  # ToolResult
+    duration_ms: int
