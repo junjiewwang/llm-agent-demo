@@ -7,6 +7,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict
 
+from src.tools.result import ToolResult
+
 
 class BaseTool(ABC):
     """工具抽象基类。
@@ -31,20 +33,7 @@ class BaseTool(ABC):
     @property
     @abstractmethod
     def parameters(self) -> Dict[str, Any]:
-        """参数定义，JSON Schema 格式。
-
-        示例:
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索关键词"
-                    }
-                },
-                "required": ["query"]
-            }
-        """
+        """参数定义，JSON Schema 格式。"""
 
     @abstractmethod
     def execute(self, **kwargs) -> str:
@@ -92,13 +81,22 @@ class ToolRegistry:
             raise KeyError(f"工具 '{name}' 未注册，可用工具: {list(self._tools.keys())}")
         return self._tools[name]
 
-    def execute(self, name: str, **kwargs) -> str:
-        """执行指定工具。"""
-        tool = self.get(name)
+    def execute(self, name: str, **kwargs) -> ToolResult:
+        """执行指定工具，返回结构化结果。
+
+        自动捕获异常并返回 ToolResult.fail()，
+        成功时通过 ToolResult.ok() 自动执行智能截断。
+        """
         try:
-            return tool.execute(**kwargs)
+            tool = self.get(name)
+        except KeyError as e:
+            return ToolResult.fail(str(e))
+
+        try:
+            raw_output = tool.execute(**kwargs)
+            return ToolResult.ok(raw_output)
         except Exception as e:
-            return f"工具 '{name}' 执行失败: {e}"
+            return ToolResult.fail(f"工具 '{name}' 执行失败: {e}")
 
     def to_openai_tools(self):
         """导出所有工具为 OpenAI Function Calling 格式。"""

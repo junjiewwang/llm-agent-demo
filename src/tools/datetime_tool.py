@@ -15,7 +15,11 @@ class DateTimeTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "获取当前的日期和时间信息，包括年月日、星期、时分秒。"
+        return (
+            "获取当前的日期和时间信息，包括年月日、星期、时分秒。"
+            "适用场景：用户询问'今天几号'、'现在几点'、'今天星期几'等时间相关问题时使用。"
+            "注意：返回的是服务器本地时区的时间。"
+        )
 
     @property
     def parameters(self) -> Dict[str, Any]:

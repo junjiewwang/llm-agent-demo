@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 
 from src.agent import ReActAgent
+from src.context import ContextBuilder
 from src.llm import OpenAIClient
 from src.memory import ConversationMemory, VectorStore
 from src.rag import KnowledgeBase
@@ -171,10 +172,14 @@ def create_conversation(
     )
     memory.set_llm_client(shared.llm_client)
 
+    # ContextBuilder 负责 Zone 分层上下文组装（KB/记忆临时注入，不污染对话历史）
+    context_builder = ContextBuilder()
+
     agent = ReActAgent(
         llm_client=shared.llm_client,
         tool_registry=shared.tool_registry,
         memory=memory,
+        context_builder=context_builder,
         vector_store=tenant.vector_store,
         knowledge_base=shared.knowledge_base,
     )

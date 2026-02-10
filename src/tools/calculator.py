@@ -55,7 +55,12 @@ class CalculatorTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "数学计算器，可以计算数学表达式。支持加(+)、减(-)、乘(*)、除(/)、取模(%)、幂(**)运算。"
+        return (
+            "安全的数学计算器，计算数学表达式并返回精确结果。"
+            "支持：加(+)、减(-)、乘(*)、除(/)、整除(//)、取模(%)、幂(**)运算。"
+            "适用场景：需要精确数值计算时使用，如单位换算、价格计算、统计数据等。"
+            "不适用：不支持变量、函数调用或编程逻辑，仅支持纯数学表达式。"
+        )
 
     @property
     def parameters(self) -> Dict[str, Any]:

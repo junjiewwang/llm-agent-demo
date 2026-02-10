@@ -26,7 +26,12 @@ class WebSearchTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "搜索互联网获取最新信息。当需要查询实时信息、新闻、或你不确定的事实时使用。"
+        return (
+            "搜索互联网获取最新信息（基于 DuckDuckGo）。"
+            "适用场景：需要查询实时信息、最新新闻、你不确定的事实、或用户明确要求搜索时使用。"
+            "不适用：如果已有知识库检索结果能回答问题，无需再搜索互联网。"
+            "限制：返回结果为摘要形式，可能不够详尽；网络请求可能超时。"
+        )
 
     @property
     def parameters(self) -> Dict[str, Any]:
