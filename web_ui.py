@@ -380,7 +380,7 @@ class AgentApp:
             logger.error("Agent 执行失败: {}", result_holder[1])
             final_content = f"❌ 执行失败: {result_holder[1]}"
         else:
-            final_content = result_holder[0] or ""
+            final_content = self._fix_markdown_tables(result_holder[0] or "")
             if thinking_lines:
                 thinking_summary = self._build_thinking_summary(thinking_lines)
                 final_content = final_content + "\n\n" + thinking_summary
@@ -407,14 +407,20 @@ class AgentApp:
             args_preview = json.dumps(event.tool_args, ensure_ascii=False)
             if len(args_preview) > 80:
                 args_preview = args_preview[:80] + "..."
-            return f"  🔧 调用工具: `{event.tool_name}` | 参数: `{args_preview}`"
+            parallel_tag = ""
+            if event.parallel_total > 1:
+                parallel_tag = f" ⚡ [{event.parallel_index}/{event.parallel_total}]"
+            return f"  🔧 调用工具: `{event.tool_name}`{parallel_tag} | 参数: `{args_preview}`"
 
         if event.type == EventType.TOOL_RESULT:
             status = "✅" if event.success else "❌"
             preview = event.tool_result_preview.replace("\n", " ")
             if len(preview) > 80:
                 preview = preview[:80] + "..."
-            return f"  {status} 结果 ({event.duration_ms}ms): {preview}"
+            parallel_tag = ""
+            if event.parallel_total > 1:
+                parallel_tag = f" [{event.parallel_index}/{event.parallel_total}]"
+            return f"  {status} 结果{parallel_tag} ({event.duration_ms}ms): {preview}"
 
         if event.type == EventType.ANSWERING:
             return "💡 **正在生成回答...**"
@@ -428,14 +434,64 @@ class AgentApp:
         return ""
 
     @staticmethod
+    def _fix_markdown_tables(text: str) -> str:
+        """修复 LLM 生成的 Markdown 表格格式问题。
+
+        常见问题：
+        1. 表格行之间有空行 → Markdown 解析器认为表格结束
+        2. 分隔行缺失或格式不对
+        3. 列数不一致
+
+        修复策略：移除表格区域内的多余空行，确保连续性。
+        """
+        lines = text.split("\n")
+        result: list[str] = []
+        in_table = False
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            is_table_line = stripped.startswith("|") and stripped.endswith("|")
+
+            if is_table_line:
+                if not in_table:
+                    in_table = True
+                result.append(line)
+            elif in_table:
+                if stripped == "":
+                    # 空行：看后续是否还有表格行，如果有则跳过空行
+                    next_table = False
+                    for j in range(i + 1, min(i + 3, len(lines))):
+                        next_stripped = lines[j].strip()
+                        if next_stripped.startswith("|") and next_stripped.endswith("|"):
+                            next_table = True
+                            break
+                        if next_stripped:
+                            break
+                    if next_table:
+                        continue  # 跳过表格中间的空行
+                    else:
+                        in_table = False
+                        result.append(line)
+                else:
+                    in_table = False
+                    result.append(line)
+            else:
+                result.append(line)
+
+        return "\n".join(result)
+
+    @staticmethod
     def _build_thinking_summary(thinking_lines: List[str]) -> str:
         """将思考过程构建为 Markdown 折叠块。"""
         # 统计轮次和工具调用数
         iterations = sum(1 for l in thinking_lines if l.startswith("🔄"))
         tool_calls = sum(1 for l in thinking_lines if l.strip().startswith("🔧"))
+        parallel_calls = sum(1 for l in thinking_lines if "⚡" in l)
         summary_title = f"💭 思考过程 ({iterations} 轮迭代"
         if tool_calls:
             summary_title += f", {tool_calls} 次工具调用"
+            if parallel_calls:
+                summary_title += f", 含 {parallel_calls} 次并发"
         summary_title += ")"
 
         detail_content = "\n".join(thinking_lines)
