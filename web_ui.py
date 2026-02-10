@@ -7,7 +7,9 @@
 - 记忆和知识库状态查看
 """
 
+import json
 import os
+import time
 import uuid
 from typing import Optional, List, Dict
 
@@ -23,16 +25,60 @@ from src.factory import (
 )
 from src.utils.logger import logger
 
-# JS: 从 localStorage 读取或生成 tenant_id，确保刷新后不变。
-# 接收当前 State 值（忽略），返回持久化的 tenant_id 写回 State。
+# JS: 从 sessionStorage 读取或生成 tenant_id（每个浏览器标签页独立），刷新后保持不变。
+# Gradio 6.x: js 回调需要返回一个数组，对应 outputs。
 _JS_LOAD_TENANT_ID = """
-(current) => {
-    let tid = localStorage.getItem('agent_tenant_id');
-    if (!tid) {
-        tid = crypto.randomUUID().replace(/-/g, '');
-        localStorage.setItem('agent_tenant_id', tid);
+(..._args) => {
+    const makeHex = (len) => {
+        const bytesLen = Math.ceil(len / 2);
+        let bytes;
+        try {
+            if (globalThis.crypto && globalThis.crypto.getRandomValues) {
+                bytes = new Uint8Array(bytesLen);
+                globalThis.crypto.getRandomValues(bytes);
+            }
+        } catch (e) {
+            // ignore, fallback below
+        }
+        if (!bytes) {
+            bytes = new Uint8Array(bytesLen);
+            for (let i = 0; i < bytesLen; i++) {
+                bytes[i] = Math.floor(Math.random() * 256);
+            }
+        }
+        return Array.from(bytes)
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('')
+            .slice(0, len);
+    };
+
+    let tid = '';
+    let err = '';
+    let persisted = true;
+
+    try {
+        tid = sessionStorage.getItem('agent_tenant_id') || '';
+        if (!tid) {
+            // 优先 randomUUID（部分浏览器/非安全上下文可能不可用）
+            if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+                tid = globalThis.crypto.randomUUID().replace(/-/g, '');
+            } else {
+                tid = makeHex(32);
+            }
+            sessionStorage.setItem('agent_tenant_id', tid);
+        }
+    } catch (e) {
+        err = String(e);
+        persisted = false;
+        // 即使 storage 不可用，也确保生成一个临时 id 让页面可用
+        if (!tid) {
+            tid = makeHex(32);
+        }
     }
-    return tid;
+
+    const meta = JSON.stringify({ persisted, err });
+    // 同时更新隐藏 tenant_id(Textbox) 和 tenant_meta(Textbox)
+    return [tid, meta];
 }
 """
 
@@ -44,6 +90,8 @@ class AgentApp:
         self._shared: Optional[SharedComponents] = None
         self._tenants: Dict[str, TenantSession] = {}
         self._initialized = False
+        self._tenant_warnings: Dict[str, str] = {}
+        self._last_restore_ts: Dict[str, float] = {}
 
     def _ensure_initialized(self) -> Optional[str]:
         """确保共享组件已初始化。返回 None 表示成功，否则返回错误信息。"""
@@ -71,11 +119,49 @@ class AgentApp:
 
     # ── 会话恢复 ──
 
-    def restore_session(self, tenant_id: str):
+    def restore_session(self, tenant_id: str, tenant_meta: str = ""):
         """页面加载/刷新时恢复会话。
 
         返回 (tenant_id, chat_history, conv_list_update, status)。
         """
+        # 幂等/去重：同一 tenant_id 在很短时间内多次触发（Gradio 前端渲染导致）时直接复用
+        now = time.monotonic()
+        last_ts = self._last_restore_ts.get(tenant_id)
+        if last_ts is not None and (now - last_ts) < 0.8:
+            tenant = self._tenants.get(tenant_id)
+            conv = tenant.get_active_conversation() if tenant else None
+            history = conv.chat_history if conv else []
+            conv_update = self._build_conv_choices(tenant_id)
+            status = self._get_status(tenant_id)
+            return tenant_id, history, conv_update, status
+        self._last_restore_ts[tenant_id] = now
+
+        # 解析前端 meta，用于提示“是否能持久化”
+        warning = ""
+        if tenant_meta:
+            try:
+                meta = json.loads(tenant_meta)
+                persisted = bool(meta.get("persisted", True))
+                err = str(meta.get("err", "") or "")
+                if not persisted:
+                    warning = "⚠️ 浏览器存储不可用：本次会话为临时会话，刷新可能丢失。"
+                    if err:
+                        warning += f"\n原因：{err}"
+            except Exception as e:
+                warning = f"⚠️ 会话元信息解析失败：{e}"
+
+        if warning:
+            self._tenant_warnings[tenant_id] = warning
+        else:
+            self._tenant_warnings.pop(tenant_id, None)
+
+        logger.info(
+            "restore_session | tenant_id={} (short={}) | tenants={} | warning={} ",
+            tenant_id,
+            tenant_id[:8] if tenant_id else "(空)",
+            list(self._tenants.keys()),
+            bool(warning),
+        )
         err = self._ensure_initialized()
         if err:
             return tenant_id, [], gr.update(choices=[], value=None), err
@@ -208,6 +294,11 @@ class AgentApp:
             f"  模型: {self._shared.llm_client.model}",
         ]
 
+        warning = self._tenant_warnings.get(tenant_id)
+        if warning:
+            lines.append("")
+            lines.append(warning)
+
         if tenant:
             conv = tenant.get_active_conversation()
             if conv:
@@ -260,8 +351,10 @@ def create_ui() -> gr.Blocks:
     app = AgentApp()
 
     with gr.Blocks(title="LLM ReAct Agent") as demo:
-        # tenant_id 通过 JS 从 localStorage 读取，刷新后保持不变
-        tenant_id = gr.State("")
+        # tenant_id 通过 JS 从 sessionStorage 读取（每个标签页独立），刷新后保持不变
+        # 使用隐藏 Textbox 承载 tenant_id，确保前端 JS 更新后能参与后续事件的 inputs
+        tenant_id = gr.Textbox(value="", visible=False, label="", show_label=False)
+        tenant_meta = gr.Textbox(value="", visible=False, label="", show_label=False)
         saved_msg = gr.State("")
 
         gr.Markdown(
@@ -349,18 +442,22 @@ def create_ui() -> gr.Blocks:
             status = app.get_status(tenant_id_val)
             return conv_update, status
 
-        # ── 页面加载：从 localStorage 恢复 tenant_id 并恢复会话 ──
-        # 第一步：JS 从 localStorage 读取 tenant_id 写入 State
+        # ── 页面加载：从 sessionStorage 恢复 tenant_id 并恢复会话 ──
+        # 第一步：JS 从 sessionStorage 读取 tenant_id 写入隐藏 Textbox
         # 第二步：Python 根据 tenant_id 恢复对话列表和聊天历史
         demo.load(
-            fn=lambda tid: tid,
+            fn=None,
             inputs=[tenant_id],
-            outputs=[tenant_id],
+            outputs=[tenant_id, tenant_meta],
             js=_JS_LOAD_TENANT_ID,
-        ).then(
+        )
+
+        # 当 tenant_id 被前端 JS 写入后，触发后端恢复对话（避免依赖 js-only 事件的 .then 链）
+        tenant_id.change(
             fn=app.restore_session,
-            inputs=[tenant_id],
+            inputs=[tenant_id, tenant_meta],
             outputs=[tenant_id, chatbot, conv_list, status_box],
+            show_progress="hidden",
         )
 
         # ── 事件绑定 ──
