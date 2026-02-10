@@ -84,6 +84,35 @@ class FilesystemSettings(BaseSettings):
     )
 
 
+class DevOpsSettings(BaseSettings):
+    """DevOps 工具配置。
+
+    环境变量前缀: DEVOPS_
+    - DEVOPS_KUBECTL_ENABLED: 是否启用 kubectl 工具（默认 False）
+    - DEVOPS_KUBECTL_READ_ONLY: kubectl 只读模式（默认 True）
+    - DEVOPS_KUBECTL_ALLOWED_NAMESPACES: 允许的 namespace（逗号分隔，空=全部）
+    - DEVOPS_KUBECTL_TIMEOUT: kubectl 命令超时（秒，默认 30）
+    - DEVOPS_DOCKER_ENABLED: 是否启用 docker 工具（默认 False）
+    - DEVOPS_DOCKER_READ_ONLY: docker 只读模式（默认 True）
+    - DEVOPS_DOCKER_TIMEOUT: docker 命令超时（秒，默认 30）
+    """
+
+    kubectl_enabled: bool = False
+    kubectl_read_only: bool = True
+    kubectl_allowed_namespaces: str = ""
+    kubectl_timeout: int = 30
+    docker_enabled: bool = False
+    docker_read_only: bool = True
+    docker_timeout: int = 30
+
+    model_config = SettingsConfigDict(
+        env_prefix="DEVOPS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class Settings:
     """全局配置聚合，各子配置独立加载 .env。"""
 
@@ -92,6 +121,7 @@ class Settings:
         self.agent = AgentSettings()
         self.search = SearchSettings()
         self.filesystem = FilesystemSettings()
+        self.devops = DevOpsSettings()
 
 
 settings = Settings()

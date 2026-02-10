@@ -6,6 +6,7 @@ from src.tools.datetime_tool import DateTimeTool
 from src.tools.web_search import WebSearchTool
 from src.tools.knowledge_search import KnowledgeSearchTool
 from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
+from src.tools.devops import CommandSandbox, CommandPolicy, KubectlTool, DockerTool
 
 __all__ = [
     "BaseTool",
@@ -22,4 +23,8 @@ __all__ = [
     "Sandbox",
     "FileReaderTool",
     "FileWriterTool",
+    "CommandSandbox",
+    "CommandPolicy",
+    "KubectlTool",
+    "DockerTool",
 ]
