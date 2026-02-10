@@ -95,6 +95,31 @@ class ConversationMemory:
         self._messages = self._messages[:self._system_prompt_count]
         logger.info("对话历史已清空")
 
+    # ── 序列化/反序列化（用于会话持久化） ──
+
+    def serialize(self) -> dict:
+        """将对话记忆序列化为可 JSON 化的字典。"""
+        return {
+            "messages": [msg.model_dump(mode="json") for msg in self._messages],
+            "system_prompt_count": self._system_prompt_count,
+        }
+
+    def restore_from(self, data: dict) -> None:
+        """从序列化数据恢复对话记忆（替换当前消息列表）。
+
+        Args:
+            data: serialize() 生成的字典，包含 messages 和 system_prompt_count。
+        """
+        raw_messages = data.get("messages", [])
+        restored: List[Message] = []
+        for item in raw_messages:
+            if "role" in item and isinstance(item["role"], str):
+                item["role"] = Role(item["role"])
+            restored.append(Message.model_validate(item))
+        self._messages = restored
+        self._system_prompt_count = data.get("system_prompt_count", 0)
+        logger.debug("对话记忆已恢复，消息数={}", len(self._messages))
+
     def _smart_truncate(self) -> None:
         """智能截断：优先摘要压缩，否则滑动窗口截断。
 
