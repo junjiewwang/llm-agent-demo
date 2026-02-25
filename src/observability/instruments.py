@@ -138,13 +138,72 @@ def set_span_messages(span: trace.Span, key: str, messages: List[dict]) -> None:
     """将 messages 列表序列化为 JSON 后写入 Span attribute。
 
     仅当 OTEL_LOG_CONTENT=true 时写入。
+
+    除了记录完整内容（per-message 截断 + 整体兜底截断），还额外写入：
+    - {key}.summary: 每条消息的 role/name/chars 分布，用于快速定位"大消息"
+    - {key}.total_chars: 截断前的真实总字符数
+    - {key}.count: 消息条数
     """
     from src.config import settings
     otel_conf = settings.otel
     if not otel_conf.log_content:
         return
-    content = json.dumps(messages, ensure_ascii=False)
-    span.set_attribute(key, _truncate(content, otel_conf.log_content_max_length))
+
+    max_length = otel_conf.log_content_max_length
+    # 单条消息 content 截断阈值：总限制的 1/4，至少 512，确保每条消息不会独占整个 attribute
+    per_msg_limit = max(max_length // 4, 512)
+
+    # 1. 构建 per-message 摘要（轻量，不受截断影响）
+    summary = _build_messages_summary(messages)
+    span.set_attribute(f"{key}.summary", json.dumps(summary, ensure_ascii=False))
+    span.set_attribute(f"{key}.count", len(messages))
+
+    # 2. 计算截断前的真实总字符数
+    total_chars = sum(len(m.get("content") or "") for m in messages)
+    span.set_attribute(f"{key}.total_chars", total_chars)
+
+    # 3. per-message 截断后序列化（使每条消息都有机会出现在 attribute 中）
+    truncated_messages = _truncate_messages(messages, per_msg_limit)
+    content = json.dumps(truncated_messages, ensure_ascii=False)
+    span.set_attribute(key, _truncate(content, max_length))
+
+
+def _build_messages_summary(messages: List[dict]) -> List[dict]:
+    """构建每条消息的轻量摘要，用于快速定位 token 消耗来源。
+
+    每条摘要包含 role、name（如有）、chars（content 字符数）、tool_calls 数量（如有），
+    通常总大小只有几百字符，不会被截断。
+    """
+    summary = []
+    for m in messages:
+        item: dict = {"role": m.get("role", "unknown")}
+        if m.get("name"):
+            item["name"] = m["name"]
+        item["chars"] = len(m.get("content") or "")
+        if m.get("tool_calls"):
+            item["tool_calls"] = len(m["tool_calls"])
+        summary.append(item)
+    return summary
+
+
+def _truncate_messages(messages: List[dict], per_msg_limit: int) -> List[dict]:
+    """对每条消息的 content 字段独立截断，避免单条大消息独占整个 attribute。
+
+    返回截断后的消息副本列表，不修改原始数据。
+    """
+    result = []
+    for m in messages:
+        content = m.get("content") or ""
+        if len(content) > per_msg_limit:
+            truncated = dict(m)
+            truncated["content"] = (
+                content[:per_msg_limit]
+                + f"...[truncated, original {len(content)} chars]"
+            )
+            result.append(truncated)
+        else:
+            result.append(m)
+    return result
 
 
 def set_span_distances(
