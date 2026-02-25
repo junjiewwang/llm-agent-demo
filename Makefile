@@ -1,11 +1,20 @@
-.PHONY: install install-backend install-frontend build clean dev dev-backend dev-frontend run check otel-jaeger otel-jaeger-stop help
+.PHONY: install install-backend install-frontend build clean dev dev-backend dev-frontend run check venv otel-jaeger otel-jaeger-stop help
+
+# ---------- Python 虚拟环境 ----------
+
+VENV := .venv
+PYTHON := $(if $(VIRTUAL_ENV),python,$(VENV)/bin/python)
+PIP := $(if $(VIRTUAL_ENV),pip,$(VENV)/bin/pip)
+
+venv:  ## 创建 Python 虚拟环境
+	@test -d $(VENV) || (echo "Creating virtual environment..." && python3 -m venv $(VENV))
 
 # ---------- 安装依赖 ----------
 
 install: install-backend install-frontend  ## 安装全部依赖
 
-install-backend:  ## 安装后端 Python 依赖
-	pip install -r requirements.txt
+install-backend: venv  ## 安装后端 Python 依赖
+	$(PIP) install -r requirements.txt
 
 install-frontend:  ## 安装前端 npm 依赖
 	cd frontend && npm install
@@ -23,9 +32,9 @@ clean:  ## 清理前端构建产物
 dev: dev-backend  ## 同时启动前后端开发服务（后台）+ 前端 dev server
 	@cd frontend && npm run dev
 
-dev-backend:  ## 启动后端开发服务（热重载，后台运行）
+dev-backend: venv  ## 启动后端开发服务（热重载，后台运行）
 	@echo "Starting backend (dev mode)..."
-	@python server.py --reload &
+	@$(PYTHON) server.py --reload &
 
 dev-frontend:  ## 单独启动前端 dev server
 	cd frontend && npm run dev
@@ -44,8 +53,8 @@ otel-jaeger-stop:  ## 停止并移除 Jaeger 容器
 
 # ---------- 生产模式 ----------
 
-run: build  ## 构建前端并启动服务（生产模式）
-	python server.py --reload
+run: build venv  ## 构建前端并启动服务（生产模式）
+	$(PYTHON) server.py --reload
 
 # ---------- 检查 ----------
 
