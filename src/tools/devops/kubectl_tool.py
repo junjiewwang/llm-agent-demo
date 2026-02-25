@@ -1,11 +1,14 @@
 """Kubernetes 集群管理工具。
 
-通过 kubectl CLI 提供 K8s 资源的查询和诊断能力。
-默认只读模式，只允许查询类子命令。
+通过 kubectl CLI 提供 K8s 资源的查询、运维和诊断能力。
+默认只读模式，只允许查询类子命令；开启写模式后所有子命令可用，
+敏感操作通过 Human-in-the-loop 确认机制保障安全。
 
-安全机制：
-- 子命令白名单（默认 Level 0 只读）
-- 危险参数拦截
+安全机制（三层防线）：
+- L0 只读子命令：直接执行，无需确认
+- L1 写操作子命令：smart 模式下触发用户确认
+- L2 危险/不可逆子命令：始终触发用户确认
+- 安全红线参数拦截（即使确认也不允许）
 - Secret 敏感数据脱敏
 - 命令注入防御（CommandSandbox）
 """
@@ -16,29 +19,38 @@ from src.tools.base_tool import BaseTool
 from src.tools.devops.command_sandbox import CommandSandbox
 
 
-# 只读子命令（Level 0）
-_READONLY_SUBCOMMANDS = frozenset({
+# ── 三级子命令分级 ──
+
+# L0: 只读查询（直接执行，无需确认）
+L0_READONLY = frozenset({
     "get", "describe", "logs", "top", "explain",
     "api-resources", "api-versions", "cluster-info",
-    "version",
+    "version", "diff", "auth",
 })
 
-# 有限写操作子命令（Level 1，需配置开启）
-_WRITE_SUBCOMMANDS = frozenset({
-    "scale", "rollout", "cordon", "uncordon", "label", "annotate",
+# L1: 运维写操作（smart 模式下需确认）
+L1_WRITE = frozenset({
+    "apply", "create", "patch", "edit",
+    "scale", "rollout", "cordon", "uncordon",
+    "label", "annotate", "taint",
+    "exec", "cp", "port-forward",
 })
 
-# 禁止的参数
-_BLOCKED_FLAGS = frozenset({
-    "--force",
+# L2: 危险/不可逆操作（始终需确认）
+L2_DANGEROUS = frozenset({
+    "delete", "drain", "replace",
+})
+
+# 所有子命令
+ALL_SUBCOMMANDS = L0_READONLY | L1_WRITE | L2_DANGEROUS
+
+# 安全红线参数（即使确认也不允许）
+BLOCKED_FLAGS = frozenset({
     "--grace-period=0",
-    "--cascade=orphan",
-    "--all-namespaces",  # 防止误操作全集群（可通过 -A 绕过，下面单独处理）
-    "-A",
 })
 
 # 敏感资源类型（输出需脱敏）
-_SENSITIVE_RESOURCES = frozenset({
+SENSITIVE_RESOURCES = frozenset({
     "secret", "secrets",
 })
 
@@ -80,23 +92,37 @@ class KubectlTool(BaseTool):
             "- explain: 查看资源字段的文档说明\n"
             "- api-resources: 列出集群所有可用的 API 资源类型\n"
             "- version: 查看客户端和服务端版本\n"
-            "- cluster-info: 查看集群信息"
+            "- cluster-info: 查看集群信息\n"
+            "- diff: 对比本地资源定义与集群当前状态的差异\n"
+            "- auth: 检查权限（如 auth can-i list pods）"
         )
         if self._enable_write:
             base += (
-                "\n\n支持的运维操作（已启用）：\n"
+                "\n\n支持的运维操作（需确认后执行）：\n"
+                "- apply: 应用资源配置（声明式）\n"
+                "- create: 创建资源（命令式）\n"
+                "- patch: 局部更新资源字段\n"
+                "- edit: 交互式编辑资源\n"
                 "- scale: 调整副本数\n"
-                "- rollout: 管理滚动更新（status/restart/undo）\n"
+                "- rollout: 管理滚动更新（status/restart/undo/history）\n"
                 "- cordon/uncordon: 标记节点不可调度/恢复调度\n"
-                "- label/annotate: 添加/修改标签或注解"
+                "- label/annotate: 添加/修改标签或注解\n"
+                "- taint: 设置节点污点\n"
+                "- exec: 在容器中执行命令\n"
+                "- cp: 在容器和本地之间复制文件\n"
+                "- port-forward: 端口转发\n"
+                "\n危险操作（需确认）：\n"
+                "- delete: 删除资源\n"
+                "- drain: 排空节点（驱逐所有 Pod）\n"
+                "- replace: 替换资源（先删后建）"
             )
         return base
 
     @property
     def parameters(self) -> Dict[str, Any]:
-        subcommands = sorted(_READONLY_SUBCOMMANDS)
+        subcommands = sorted(L0_READONLY)
         if self._enable_write:
-            subcommands = sorted(_READONLY_SUBCOMMANDS | _WRITE_SUBCOMMANDS)
+            subcommands = sorted(ALL_SUBCOMMANDS)
 
         return {
             "type": "object",
@@ -122,6 +148,7 @@ class KubectlTool(BaseTool):
                     "description": (
                         "命名空间（默认 default）。"
                         "使用 'get namespaces' 可查看所有命名空间。"
+                        "使用 '--all-namespaces' 或 '-A' 在 flags 中可跨全部命名空间查询。"
                     ),
                 },
                 "flags": {
@@ -130,7 +157,10 @@ class KubectlTool(BaseTool):
                         "附加参数，空格分隔。常用：\n"
                         "  -o wide（更多列）、-o yaml（YAML 格式）、-o json（JSON 格式）\n"
                         "  --tail=100（限制日志行数）、--previous（上次容器日志）\n"
-                        "  -l app=nginx（标签选择器）、--sort-by=.status.startTime"
+                        "  -l app=nginx（标签选择器）、--sort-by=.status.startTime\n"
+                        "  -A / --all-namespaces（跨全部命名空间）\n"
+                        "  -f filename.yaml（指定文件，用于 apply/create/delete 等）\n"
+                        "  --dry-run=client（模拟执行，不实际变更）"
                     ),
                 },
             },
@@ -138,9 +168,20 @@ class KubectlTool(BaseTool):
         }
 
     def should_confirm(self, **kwargs) -> bool:
-        """写操作子命令需要用户确认。"""
+        """判断是否需要用户确认。
+
+        - L0 只读：不需要确认
+        - L1 写操作：smart 模式下需确认
+        - L2 危险操作：始终需确认
+        - 写操作 + 全集群范围（-A/--all-namespaces）：需确认
+        """
         subcommand = kwargs.get("subcommand", "")
-        return subcommand in _WRITE_SUBCOMMANDS
+        if subcommand in L1_WRITE or subcommand in L2_DANGEROUS:
+            return True
+
+        # 只读命令 + 全集群写标志组合不存在，但防御性检查：
+        # 如果未来有 L0 命令携带了写入性质的 flags，也可在此扩展
+        return False
 
     def execute(self, **kwargs) -> str:
         subcommand: str = kwargs.get("subcommand", "")
