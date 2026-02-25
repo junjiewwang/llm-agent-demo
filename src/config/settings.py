@@ -22,11 +22,20 @@ class LLMSettings(BaseSettings):
 
 
 class AgentSettings(BaseSettings):
-    """Agent 相关配置。"""
+    """Agent 相关配置。
+
+    环境变量前缀: AGENT_
+    - AGENT_KB_RELEVANCE_THRESHOLD: 知识库检索相关度阈值（cosine distance，默认 0.7）
+    - AGENT_MEMORY_RELEVANCE_THRESHOLD: 长期记忆检索相关度阈值（cosine distance，默认 0.7）
+    - AGENT_TOOL_CONFIRM_MODE: 工具执行确认模式（"never" | "smart" | "always"，默认 "smart"）
+    """
 
     max_iterations: int = 10
     temperature: float = 0.7
     max_tokens: int = 4096
+    kb_relevance_threshold: float = 0.7
+    memory_relevance_threshold: float = 0.7
+    tool_confirm_mode: str = "smart"
 
     model_config = SettingsConfigDict(
         env_prefix="AGENT_",
@@ -95,6 +104,11 @@ class DevOpsSettings(BaseSettings):
     - DEVOPS_DOCKER_ENABLED: 是否启用 docker 工具（默认 False）
     - DEVOPS_DOCKER_READ_ONLY: docker 只读模式（默认 True）
     - DEVOPS_DOCKER_TIMEOUT: docker 命令超时（秒，默认 30）
+    - DEVOPS_CURL_ENABLED: 是否启用 curl HTTP 请求工具（默认 False）
+    - DEVOPS_CURL_READ_ONLY: curl 只读模式（默认 True，仅 GET/HEAD/OPTIONS）
+    - DEVOPS_CURL_TIMEOUT: 请求超时（秒，默认 30）
+    - DEVOPS_CURL_ALLOWED_HOSTS: Host 白名单（逗号分隔，空=不限制）
+    - DEVOPS_CURL_MAX_RESPONSE_BYTES: 最大响应大小（字节，默认 1MB）
     """
 
     kubectl_enabled: bool = False
@@ -104,9 +118,45 @@ class DevOpsSettings(BaseSettings):
     docker_enabled: bool = False
     docker_read_only: bool = True
     docker_timeout: int = 30
+    curl_enabled: bool = False
+    curl_read_only: bool = True
+    curl_timeout: int = 30
+    curl_allowed_hosts: str = ""
+    curl_max_response_bytes: int = 1_048_576
 
     model_config = SettingsConfigDict(
         env_prefix="DEVOPS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+class OtelSettings(BaseSettings):
+    """OpenTelemetry 可观测性配置。
+
+    环境变量前缀: OTEL_
+    - OTEL_ENABLED: 总开关（默认 false），false 时零开销
+    - OTEL_SERVICE_NAME: 服务名
+    - OTEL_EXPORTER_PROTOCOL: 导出协议 ("grpc" | "http")，默认 grpc
+    - OTEL_EXPORTER_ENDPOINT: OTLP 端点（gRPC 默认 4317，HTTP 默认 4318）
+    - OTEL_EXPORTER_HEADERS: OTLP 鉴权 Header（格式: key=value，多个逗号分隔，留空=无鉴权）
+    - OTEL_CONSOLE_EXPORT: 开发模式将 trace 输出到控制台
+    - OTEL_LOG_CONTENT: 是否在 Span 中记录 LLM 输入/输出内容（默认 false，生产安全）
+    - OTEL_LOG_CONTENT_MAX_LENGTH: 单字段最大字符数（防止 Span 过大）
+    """
+
+    enabled: bool = False
+    service_name: str = "llm-react-agent"
+    exporter_protocol: str = "grpc"
+    exporter_endpoint: str = "http://localhost:4317"
+    exporter_headers: str = ""
+    console_export: bool = False
+    log_content: bool = False
+    log_content_max_length: int = 4096
+
+    model_config = SettingsConfigDict(
+        env_prefix="OTEL_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
@@ -122,6 +172,7 @@ class Settings:
         self.search = SearchSettings()
         self.filesystem = FilesystemSettings()
         self.devops = DevOpsSettings()
+        self.otel = OtelSettings()
 
 
 settings = Settings()

@@ -31,3 +31,7 @@ Thumbs.db
 
 # Agent data (vector store etc.)
 .agent_data/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
