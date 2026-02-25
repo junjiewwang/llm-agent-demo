@@ -163,6 +163,25 @@ class OtelSettings(BaseSettings):
     )
 
 
+class SkillSettings(BaseSettings):
+    """Skills 系统配置。
+
+    环境变量前缀: SKILLS_
+    - SKILLS_DIRS: Skill 扫描目录（逗号分隔，支持多目录），扫描包含 SKILL.md 的子目录，默认 "skills"
+    - SKILLS_DISABLED: 禁用的 Skill 名称列表（逗号分隔），默认为空
+    """
+
+    dirs: str = "skills"
+    disabled: str = ""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SKILLS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class Settings:
     """全局配置聚合，各子配置独立加载 .env。"""
 
@@ -173,6 +192,7 @@ class Settings:
         self.filesystem = FilesystemSettings()
         self.devops = DevOpsSettings()
         self.otel = OtelSettings()
+        self.skills = SkillSettings()
 
 
 settings = Settings()

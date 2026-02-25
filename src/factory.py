@@ -18,6 +18,7 @@ from src.context import ContextBuilder
 from src.llm import OpenAIClient
 from src.memory import ConversationMemory, VectorStore
 from src.rag import KnowledgeBase
+from src.skills import SkillRegistry, SkillRouter, load_from_directory
 from src.tools import (
     ToolRegistry, CalculatorTool, DateTimeTool, WebSearchTool, KnowledgeSearchTool,
 )
@@ -25,10 +26,10 @@ from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
 from src.tools.devops import CommandSandbox, CommandPolicy, KubectlTool, DockerTool, CurlTool
 from src.tools.devops.curl_tool import HttpRequestPolicy, HttpSandbox
 from src.tools.devops.kubectl_tool import (
-    _READONLY_SUBCOMMANDS as _K8S_RO,
-    _WRITE_SUBCOMMANDS as _K8S_WR,
-    _BLOCKED_FLAGS as _K8S_BLOCKED,
-    _SENSITIVE_RESOURCES as _K8S_SENSITIVE,
+    L0_READONLY as _K8S_L0,
+    ALL_SUBCOMMANDS as _K8S_ALL,
+    BLOCKED_FLAGS as _K8S_BLOCKED,
+    SENSITIVE_RESOURCES as _K8S_SENSITIVE,
 )
 from src.tools.devops.docker_tool import (
     L0_READONLY as _DOCKER_RO,
@@ -87,6 +88,7 @@ class SharedComponents:
     llm_client: OpenAIClient
     tool_registry: ToolRegistry
     knowledge_base: Optional[KnowledgeBase] = None
+    skill_router: Optional[SkillRouter] = None
 
 
 @dataclass
@@ -169,7 +171,7 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
     devops_config = settings.devops
 
     if devops_config.kubectl_enabled:
-        allowed_subs = _K8S_RO | _K8S_WR if not devops_config.kubectl_read_only else _K8S_RO
+        allowed_subs = _K8S_ALL if not devops_config.kubectl_read_only else _K8S_L0
         policy = CommandPolicy(
             binary="kubectl",
             allowed_subcommands=allowed_subs,
@@ -241,6 +243,61 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
         )
 
 
+def create_skill_router(tool_registry: ToolRegistry) -> SkillRouter:
+    """创建 Skill 路由器，从配置目录自动发现并加载所有 SKILL.md。
+
+    扫描 SKILLS_DIRS 配置的目录（逗号分隔，支持多目录），
+    自动加载所有包含 SKILL.md 的子目录为 Skill，并过滤 SKILLS_DISABLED 中指定的 Skill。
+
+    目录结构：
+        skills/
+        ├── k8s-troubleshooting/
+        │   └── SKILL.md
+        └── k8s-resource-analysis/
+            └── SKILL.md
+
+    Args:
+        tool_registry: 工具注册中心，用于校验 Skill 依赖的工具是否可用。
+
+    Returns:
+        配置好的 SkillRouter 实例。
+    """
+    from pathlib import Path
+
+    skills_config = settings.skills
+    registry = SkillRegistry()
+
+    # 解析配置：扫描目录和禁用列表
+    scan_dirs = [d.strip() for d in skills_config.dirs.split(",") if d.strip()]
+    disabled = {s.strip() for s in skills_config.disabled.split(",") if s.strip()}
+
+    if disabled:
+        logger.info("Skills 禁用列表: {}", disabled)
+
+    # 从每个目录自动发现并加载 SKILL.md
+    total_loaded = 0
+    for dir_path in scan_dirs:
+        path = Path(dir_path)
+        skills = load_from_directory(path, disabled_skills=disabled)
+        for skill in skills:
+            try:
+                registry.register(skill)
+                total_loaded += 1
+            except ValueError as e:
+                logger.warning("Skill 注册失败: {}", e)
+
+    # 校验 Skill 依赖的工具
+    warnings = registry.validate_tools(tool_registry.tool_names)
+    for w in warnings:
+        logger.warning(w)
+
+    logger.info(
+        "Skills 系统初始化完成 | 扫描目录: {} | 已加载: {} 个 | 已注册: {}",
+        scan_dirs, total_loaded, registry.skill_names,
+    )
+    return SkillRouter(registry)
+
+
 def create_shared_components() -> SharedComponents:
     """创建全局共享组件。
 
@@ -256,11 +313,13 @@ def create_shared_components() -> SharedComponents:
         logger.warning("知识库初始化失败: {}", e)
 
     tool_registry = create_tool_registry(knowledge_base)
+    skill_router = create_skill_router(tool_registry)
 
     return SharedComponents(
         llm_client=llm_client,
         tool_registry=tool_registry,
         knowledge_base=knowledge_base,
+        skill_router=skill_router,
     )
 
 
@@ -306,6 +365,7 @@ def create_conversation(
         context_builder=context_builder,
         vector_store=tenant.vector_store,
         knowledge_base=shared.knowledge_base,
+        skill_router=shared.skill_router,
     )
 
     conv = Conversation(
@@ -361,6 +421,7 @@ def restore_conversation(
         context_builder=context_builder,
         vector_store=tenant.vector_store,
         knowledge_base=shared.knowledge_base,
+        skill_router=shared.skill_router,
     )
 
     conv = Conversation(
