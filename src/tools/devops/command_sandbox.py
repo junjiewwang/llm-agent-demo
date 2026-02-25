@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from typing import Optional
 
 from src.utils.logger import logger
 
@@ -61,7 +62,7 @@ class CommandSandbox:
 
     def __init__(self, policy: CommandPolicy):
         self._policy: CommandPolicy = policy
-        self._binary_path: str | None = self._resolve_binary(policy.binary)
+        self._binary_path: Optional[str] = self._resolve_binary(policy.binary)
 
     @property
     def policy(self) -> CommandPolicy:
@@ -73,7 +74,7 @@ class CommandSandbox:
         return self._binary_path is not None
 
     @staticmethod
-    def _resolve_binary(binary: str) -> str | None:
+    def _resolve_binary(binary: str) -> Optional[str]:
         """解析二进制路径，不存在则返回 None。"""
         path = shutil.which(binary)
         if not path:

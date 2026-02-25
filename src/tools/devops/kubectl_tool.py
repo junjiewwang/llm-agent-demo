@@ -10,7 +10,7 @@
 - 命令注入防御（CommandSandbox）
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from src.tools.base_tool import BaseTool
 from src.tools.devops.command_sandbox import CommandSandbox
@@ -56,7 +56,7 @@ class KubectlTool(BaseTool):
         self,
         sandbox: CommandSandbox,
         enable_write: bool = False,
-        allowed_namespaces: list[str] | None = None,
+        allowed_namespaces: Optional[List[str]] = None,
     ):
         self._sandbox = sandbox
         self._enable_write = enable_write
@@ -136,6 +136,11 @@ class KubectlTool(BaseTool):
             },
             "required": ["subcommand"],
         }
+
+    def should_confirm(self, **kwargs) -> bool:
+        """写操作子命令需要用户确认。"""
+        subcommand = kwargs.get("subcommand", "")
+        return subcommand in _WRITE_SUBCOMMANDS
 
     def execute(self, **kwargs) -> str:
         subcommand: str = kwargs.get("subcommand", "")

@@ -1,12 +1,15 @@
 """Docker 容器管理工具。
 
-通过 docker CLI 提供容器和镜像的查询与诊断能力。
-默认只读模式，只允许查询类子命令。
+通过 docker CLI 提供容器和镜像的查询、运维与诊断能力。
+默认只读模式，只允许查询类子命令；开启写模式后所有子命令可用，
+敏感操作通过 Human-in-the-loop 确认机制保障安全。
 
-安全机制：
-- 子命令白名单（默认 Level 0 只读）
-- 禁止 exec、run --privileged 等危险操作
+安全机制（三层防线）：
+- L0 只读子命令：直接执行，无需确认
+- L1 写操作子命令：smart 模式下触发用户确认
+- L2 危险/不可逆子命令：始终触发用户确认
 - 命令注入防御（CommandSandbox）
+- 危险参数拦截（--privileged 等）
 """
 
 from typing import Any, Dict
@@ -15,26 +18,32 @@ from src.tools.base_tool import BaseTool
 from src.tools.devops.command_sandbox import CommandSandbox
 
 
-# 只读子命令（Level 0）
-_READONLY_SUBCOMMANDS = frozenset({
+# ── 三级子命令分级 ──
+
+# L0: 只读查询（直接执行，无需确认）
+L0_READONLY = frozenset({
     "ps", "images", "logs", "inspect", "stats",
     "network", "volume", "system", "version", "info",
-    "compose",
+    "compose", "top",
 })
 
-# 有限写操作子命令（Level 1，需配置开启）
-_WRITE_SUBCOMMANDS = frozenset({
-    "start", "stop", "restart",
+# L1: 运维写操作（smart 模式下需确认）
+L1_WRITE = frozenset({
+    "start", "stop", "restart", "pull", "build",
+    "exec", "run", "cp", "tag", "create",
 })
 
-# 禁止的参数
-_BLOCKED_FLAGS = frozenset({
+# L2: 危险/不可逆操作（始终需确认）
+L2_DANGEROUS = frozenset({
+    "rm", "rmi", "kill", "prune", "push",
+})
+
+# 所有子命令
+ALL_SUBCOMMANDS = L0_READONLY | L1_WRITE | L2_DANGEROUS
+
+# 禁止的参数（安全红线，即使确认也不允许）
+BLOCKED_FLAGS = frozenset({
     "--privileged",
-    "--rm",
-    "--force",
-    "-f",
-    "--volumes",
-    "--rmi",
 })
 
 
@@ -68,6 +77,7 @@ class DockerTool(BaseTool):
             "- logs: 查看容器日志（支持 --tail 限制行数，--since 按时间过滤）\n"
             "- inspect: 查看容器或镜像的详细 JSON 配置\n"
             "- stats: 查看容器资源使用（CPU/内存/网络），必须加 --no-stream\n"
+            "- top: 查看容器内运行的进程\n"
             "- network ls/inspect: 查看 Docker 网络\n"
             "- volume ls/inspect: 查看 Docker 卷\n"
             "- system df: 查看 Docker 磁盘使用\n"
@@ -77,18 +87,25 @@ class DockerTool(BaseTool):
         )
         if self._enable_write:
             base += (
-                "\n\n支持的运维操作（已启用）：\n"
-                "- start: 启动已停止的容器\n"
-                "- stop: 优雅停止运行中的容器\n"
-                "- restart: 重启容器"
+                "\n\n支持的运维操作（需确认后执行）：\n"
+                "- start/stop/restart: 容器生命周期管理\n"
+                "- exec: 在运行中的容器内执行命令\n"
+                "- run: 创建并运行新容器\n"
+                "- cp: 在容器与宿主机之间复制文件\n"
+                "- pull/build/tag/create: 镜像与容器构建\n"
+                "\n危险操作（需确认）：\n"
+                "- rm/rmi: 删除容器或镜像\n"
+                "- kill: 强制终止容器\n"
+                "- prune: 清理未使用的资源\n"
+                "- push: 推送镜像到远程仓库"
             )
         return base
 
     @property
     def parameters(self) -> Dict[str, Any]:
-        subcommands = sorted(_READONLY_SUBCOMMANDS)
+        subcommands = sorted(L0_READONLY)
         if self._enable_write:
-            subcommands = sorted(_READONLY_SUBCOMMANDS | _WRITE_SUBCOMMANDS)
+            subcommands = sorted(ALL_SUBCOMMANDS)
 
         return {
             "type": "object",
@@ -105,7 +122,7 @@ class DockerTool(BaseTool):
                     "type": "string",
                     "description": (
                         "目标容器名/ID 或镜像名（部分命令需要，"
-                        "如 logs、inspect、start、stop 等）"
+                        "如 logs、inspect、start、stop、exec 等）"
                     ),
                 },
                 "flags": {
@@ -115,12 +132,24 @@ class DockerTool(BaseTool):
                         "  --all（显示所有容器）、--tail=50（限制日志行数）\n"
                         "  --since=1h（最近 1 小时日志）、--no-stream（stats 单次快照）\n"
                         "  --format 'table {{.Names}}\\t{{.Status}}'（自定义输出格式）\n"
-                        "  --filter name=xxx（按名称过滤）"
+                        "  --filter name=xxx（按名称过滤）\n"
+                        "  exec 场景: 直接写要执行的命令，如 'ls -la /app'"
                     ),
                 },
             },
             "required": ["subcommand"],
         }
+
+    def should_confirm(self, **kwargs) -> bool:
+        """判断是否需要用户确认。
+
+        - L0 只读：不需要确认
+        - L1 写操作：smart 模式下需确认
+        - L2 危险操作：始终需确认
+        """
+        raw = kwargs.get("subcommand", "")
+        subcommand = raw.strip().split()[0] if raw.strip() else ""
+        return subcommand in L1_WRITE or subcommand in L2_DANGEROUS
 
     def execute(self, **kwargs) -> str:
         raw_subcommand: str = kwargs.get("subcommand", "")

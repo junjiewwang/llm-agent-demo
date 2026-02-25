@@ -46,8 +46,23 @@ _EXCEL_EXTENSIONS: set[str] = {".xlsx", ".xls"}
 
 
 def _is_binary_file(file_path: Path) -> bool:
-    """判断文件是否为已知的二进制/富格式文件。"""
-    return file_path.suffix.lower() in _BINARY_EXTENSIONS
+    """判断文件是否为二进制文件。
+
+    采用两层检测策略：
+    1. 扩展名匹配：快速判断已知的二进制扩展名（零 I/O 开销）
+    2. 内容检测：读取文件头部字节检查 null 字节（兜底无扩展名的二进制文件，如 /usr/bin/curl）
+    这与 git 判断二进制文件的策略一致。
+    """
+    # 第一层：扩展名快速匹配
+    if file_path.suffix.lower() in _BINARY_EXTENSIONS:
+        return True
+    # 第二层：内容检测 — 读前 8192 字节检查 null 字节
+    try:
+        with open(file_path, "rb") as f:
+            chunk = f.read(8192)
+            return b"\x00" in chunk
+    except (OSError, PermissionError):
+        return False
 
 
 def _binary_file_hint(file_path: Path) -> str:
@@ -63,11 +78,11 @@ def _binary_file_hint(file_path: Path) -> str:
         ".tar": "TAR 归档",
         ".gz": "GZip 压缩文件",
     }
-    file_type = hints.get(suffix, f"{suffix} 二进制文件")
+    file_type = hints.get(suffix, "二进制文件" if not suffix else f"{suffix} 二进制文件")
     return (
         f"⚠️ 无法以文本方式读取: {file_path.name}\n"
         f"文件类型: {file_type}\n"
-        f"建议: 如果是 PDF，请通过知识库上传功能导入。"
+        f"该文件包含二进制内容，无法作为文本处理。"
     )
 
 
@@ -362,6 +377,19 @@ class FileReaderTool(BaseTool):
         # 其他二进制文件直接返回友好提示
         if _is_binary_file(file_path):
             return _binary_file_hint(file_path)
+
+        # 文件大小保护：超过 Sandbox 限制的文件拒绝读取，防止 token 爆炸
+        try:
+            file_size = file_path.stat().st_size
+            if file_size > self._sandbox.max_file_size:
+                return (
+                    f"⚠️ 文件过大，无法读取: {file_path.name}\n"
+                    f"文件大小: {_format_size(file_size)}，"
+                    f"限制: {_format_size(self._sandbox.max_file_size)}\n"
+                    f"建议: 使用 offset 和 limit 参数分段读取。"
+                )
+        except OSError as e:
+            return f"⚠️ 无法获取文件信息: {file_path.name}，错误: {e}"
 
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()

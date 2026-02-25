@@ -7,7 +7,11 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict
 
+from src.observability import get_tracer
+from src.observability.instruments import trace_span, set_span_content
 from src.tools.result import ToolResult
+
+_tracer = get_tracer(__name__)
 
 
 class BaseTool(ABC):
@@ -45,6 +49,20 @@ class BaseTool(ABC):
         Returns:
             执行结果的字符串表示（将作为 tool message 回传给 LLM）。
         """
+
+    def should_confirm(self, **kwargs) -> bool:
+        """判断本次调用是否需要用户确认。
+
+        子类可覆写此方法，根据具体参数判断是否为高风险操作。
+        默认返回 False（不需要确认）。
+
+        Args:
+            **kwargs: 与 execute 相同的参数。
+
+        Returns:
+            True 表示需要用户确认后才能执行。
+        """
+        return False
 
     def to_openai_tool(self) -> Dict[str, Any]:
         """转换为 OpenAI Function Calling 的 tool 格式。"""
@@ -86,17 +104,26 @@ class ToolRegistry:
 
         自动捕获异常并返回 ToolResult.fail()，
         成功时通过 ToolResult.ok() 自动执行智能截断。
+        每次执行创建 tool.execute.{name} span 用于可观测性。
         """
         try:
             tool = self.get(name)
         except KeyError as e:
             return ToolResult.fail(str(e))
 
-        try:
-            raw_output = tool.execute(**kwargs)
-            return ToolResult.ok(raw_output)
-        except Exception as e:
-            return ToolResult.fail(f"工具 '{name}' 执行失败: {e}")
+        with trace_span(_tracer, f"tool.execute.{name}", {"tool.name": name}) as span:
+            set_span_content(span, "tool.input", str(kwargs))
+            try:
+                raw_output = tool.execute(**kwargs)
+                result = ToolResult.ok(raw_output)
+                span.set_attribute("tool.success", True)
+                set_span_content(span, "tool.output", result.to_message()[:500])
+                return result
+            except Exception as e:
+                result = ToolResult.fail(f"工具 '{name}' 执行失败: {e}")
+                span.set_attribute("tool.success", False)
+                span.set_attribute("tool.error", str(e))
+                return result
 
     def to_openai_tools(self):
         """导出所有工具为 OpenAI Function Calling 格式。"""
