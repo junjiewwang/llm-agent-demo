@@ -1,0 +1,40 @@
+@import 'tailwindcss';
+
+/* 自定义滚动条 — 细窄、半透明、圆角 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(150, 150, 150, 0.3) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(150, 150, 150, 0.25);
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(150, 150, 150, 0.5);
+}
+
+/* 暗色模式下稍微调亮 */
+@media (prefers-color-scheme: dark) {
+  * {
+    scrollbar-color: rgba(200, 200, 200, 0.2) transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: rgba(200, 200, 200, 0.15);
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgba(200, 200, 200, 0.35);
+  }
+}
