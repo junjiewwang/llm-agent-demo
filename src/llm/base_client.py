@@ -25,6 +25,8 @@ class Message(BaseModel):
     tool_calls: Optional[List[dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    # Token 用量（仅 LLM 响应时填充，用于可观测性）
+    usage: Optional[dict] = None  # { prompt_tokens, completion_tokens, total_tokens }
 
     def to_dict(self) -> dict[str, Any]:
         """转换为 API 请求格式，过滤 None 字段。"""
@@ -37,6 +39,7 @@ class Message(BaseModel):
             data["tool_call_id"] = self.tool_call_id
         if self.name is not None:
             data["name"] = self.name
+        # usage 不参与 API 请求，仅用于内部追踪
         return data
 
 

@@ -4,14 +4,21 @@
 只需配置不同的 base_url 和 api_key 即可切换。
 """
 
+import json
+import time
 from typing import Any, Generator, Optional, List, Dict
 
 from openai import OpenAI
+from opentelemetry.trace import StatusCode
 
 from src.config import settings
 from src.llm.base_client import BaseLLMClient, Message, Role
+from src.observability import get_tracer
+from src.observability.instruments import record_llm_metrics, set_span_content, set_span_messages
 from src.utils.logger import logger
 from src.utils.retry import llm_retry
+
+_tracer = get_tracer(__name__)
 
 
 class OpenAIClient(BaseLLMClient):
@@ -57,11 +64,59 @@ class OpenAIClient(BaseLLMClient):
         """同步对话调用。"""
         kwargs = self._build_request_kwargs(messages, tools, temperature, max_tokens)
 
-        logger.debug("发送请求 | messages={}", len(messages))
-        response = self._client.chat.completions.create(**kwargs)
-        choice = response.choices[0].message
+        with _tracer.start_as_current_span("llm.chat") as span:
+            span.set_attribute("llm.model", self._model)
+            span.set_attribute("llm.message_count", len(messages))
+            span.set_attribute("llm.has_tools", bool(tools))
 
-        return self._parse_response(choice)
+            # 记录输入 messages
+            set_span_messages(span, "llm.input_messages", [m.to_dict() for m in messages])
+
+            logger.debug("发送请求 | messages={}", len(messages))
+            start = time.monotonic()
+            response = self._client.chat.completions.create(**kwargs)
+            duration_ms = (time.monotonic() - start) * 1000
+            choice = response.choices[0].message
+
+            msg = self._parse_response(choice)
+
+            # 提取 token 用量，附加到 Message 上（用于可观测性）
+            prompt_tokens = 0
+            completion_tokens = 0
+            if response.usage:
+                prompt_tokens = response.usage.prompt_tokens or 0
+                completion_tokens = response.usage.completion_tokens or 0
+                msg.usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": response.usage.total_tokens or 0,
+                }
+
+            # Span attributes
+            span.set_attribute("llm.prompt_tokens", prompt_tokens)
+            span.set_attribute("llm.completion_tokens", completion_tokens)
+            span.set_attribute("llm.total_tokens", prompt_tokens + completion_tokens)
+            span.set_attribute("llm.has_tool_calls", bool(msg.tool_calls))
+            span.set_attribute("llm.duration_ms", round(duration_ms, 1))
+
+            # 记录输出内容
+            set_span_content(span, "llm.output_content", msg.content or "")
+            if msg.tool_calls:
+                set_span_content(
+                    span, "llm.output_tool_calls",
+                    json.dumps(msg.tool_calls, ensure_ascii=False),
+                )
+
+            # Metrics
+            record_llm_metrics(
+                model=self._model,
+                call_type="chat",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                duration_ms=duration_ms,
+            )
+
+            return msg
 
     @llm_retry(max_attempts=3)
     def chat_stream(

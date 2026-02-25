@@ -22,7 +22,8 @@ from src.tools import (
     ToolRegistry, CalculatorTool, DateTimeTool, WebSearchTool, KnowledgeSearchTool,
 )
 from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
-from src.tools.devops import CommandSandbox, CommandPolicy, KubectlTool, DockerTool
+from src.tools.devops import CommandSandbox, CommandPolicy, KubectlTool, DockerTool, CurlTool
+from src.tools.devops.curl_tool import HttpRequestPolicy, HttpSandbox
 from src.tools.devops.kubectl_tool import (
     _READONLY_SUBCOMMANDS as _K8S_RO,
     _WRITE_SUBCOMMANDS as _K8S_WR,
@@ -30,9 +31,9 @@ from src.tools.devops.kubectl_tool import (
     _SENSITIVE_RESOURCES as _K8S_SENSITIVE,
 )
 from src.tools.devops.docker_tool import (
-    _READONLY_SUBCOMMANDS as _DOCKER_RO,
-    _WRITE_SUBCOMMANDS as _DOCKER_WR,
-    _BLOCKED_FLAGS as _DOCKER_BLOCKED,
+    L0_READONLY as _DOCKER_RO,
+    ALL_SUBCOMMANDS as _DOCKER_ALL,
+    BLOCKED_FLAGS as _DOCKER_BLOCKED,
 )
 from src.config import settings
 from src.utils.logger import logger
@@ -51,6 +52,13 @@ SYSTEM_PROMPT = """你是一个智能助手，能够自主思考和使用工具�
 4. 如果一个工具不够，可以连续调用多个工具
 5. 如果上下文中已有知识库或记忆内容，直接基于它们回答
 6. 当需要对多个目标执行相同类型的操作时（如查询多个 namespace 的资源、读取多个文件），请在一次回复中同时调用多个工具，而不是逐个调用
+
+能力边界（严格遵守）：
+- 你只能使用当前已注册的工具，不要尝试通过写脚本、读取二进制文件等间接方式来模拟不存在的工具功能
+- 如果用户需要的功能没有对应的工具，直接告知用户当前不支持该操作，并建议管理员启用相关工具
+- 不要写 shell 脚本试图间接执行命令，不要读取 /usr/bin 等系统目录下的二进制文件
+- 如果连续 2 次工具调用都未能取得有效进展，应停止尝试并向用户说明情况
+- 当工具执行失败时，必须如实告知用户失败原因（如权限不足、命令不被允许、参数错误等），不得隐瞒错误或回避工具报错，更不能臆测其他无关原因来代替真实原因。可以在说明失败原因后，再提供替代方案或建议
 
 请用简洁、准确的语言回答问题。"""
 
@@ -186,7 +194,7 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
         )
 
     if devops_config.docker_enabled:
-        allowed_subs = _DOCKER_RO | _DOCKER_WR if not devops_config.docker_read_only else _DOCKER_RO
+        allowed_subs = _DOCKER_ALL if not devops_config.docker_read_only else _DOCKER_RO
         policy = CommandPolicy(
             binary="docker",
             allowed_subcommands=allowed_subs,
@@ -203,6 +211,30 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
         logger.info(
             "docker 工具已注册 (只读={})",
             devops_config.docker_read_only,
+        )
+
+    if devops_config.curl_enabled:
+        allowed_hosts = frozenset(
+            h.strip()
+            for h in devops_config.curl_allowed_hosts.split(",")
+            if h.strip()
+        )
+        http_policy = HttpRequestPolicy(
+            allowed_hosts=allowed_hosts,
+            timeout=devops_config.curl_timeout,
+            max_response_bytes=devops_config.curl_max_response_bytes,
+        )
+        http_sandbox = HttpSandbox(http_policy)
+        registry.register(
+            CurlTool(
+                sandbox=http_sandbox,
+                enable_write=not devops_config.curl_read_only,
+            )
+        )
+        logger.info(
+            "curl 工具已注册 (只读={}, host限制={})",
+            devops_config.curl_read_only,
+            sorted(allowed_hosts) if allowed_hosts else "无",
         )
 
 
@@ -340,6 +372,23 @@ def restore_conversation(
     tenant.conversations[conv_id] = conv
     logger.info("恢复对话 {} (租户 {})", conv_id, tenant.tenant_id[:8])
     return conv
+
+
+def create_command_registry():
+    """创建系统命令注册器，注册所有可用命令。"""
+    from src.commands import CommandRegistry
+    from src.commands.memory_cmd import MemoryCommand
+    from src.commands.context_cmd import ContextCommand
+    from src.commands.status_cmd import StatusCommand
+    from src.commands.help_cmd import HelpCommand
+
+    registry = CommandRegistry()
+    registry.register(MemoryCommand())
+    registry.register(ContextCommand())
+    registry.register(StatusCommand())
+    # HelpCommand 需要引用 registry 来展示所有命令
+    registry.register(HelpCommand(registry))
+    return registry
 
 
 def create_agent(max_memory_tokens: int = 8000) -> AgentComponents:

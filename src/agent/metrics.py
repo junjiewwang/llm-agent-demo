@@ -5,7 +5,7 @@
 
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -15,6 +15,15 @@ class ToolCallRecord:
     success: bool
     duration_ms: float
     error: str = ""
+
+
+@dataclass
+class LLMCallRecord:
+    """单次 LLM 调用的记录。"""
+    call_type: str  # "chat", "extract_facts", "force_answer"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 @dataclass
@@ -40,6 +49,9 @@ class RunMetrics:
     # 工具调用
     tool_calls: List[ToolCallRecord] = field(default_factory=list)
 
+    # LLM 调用明细
+    llm_calls: List[LLMCallRecord] = field(default_factory=list)
+
     # 耗时
     start_time: float = field(default_factory=time.monotonic)
     end_time: float = 0.0
@@ -47,6 +59,10 @@ class RunMetrics:
     @property
     def total_tokens(self) -> int:
         return self.total_input_tokens + self.total_output_tokens
+
+    @property
+    def llm_call_count(self) -> int:
+        return len(self.llm_calls)
 
     @property
     def duration_ms(self) -> float:
@@ -73,6 +89,31 @@ class RunMetrics:
             ToolCallRecord(name=name, success=success, duration_ms=duration_ms, error=error)
         )
 
+    def record_llm_call(self, usage: Optional[dict], call_type: str = "chat") -> None:
+        """记录一次 LLM 调用的 token 用量。
+
+        Args:
+            usage: Message.usage 字段（来自 OpenAI response.usage），可为 None。
+            call_type: 调用类型标识（"chat" / "extract_facts" / "force_answer"）。
+        """
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+
+        if usage:
+            prompt_tokens = usage.get("prompt_tokens", 0) or 0
+            completion_tokens = usage.get("completion_tokens", 0) or 0
+            total_tokens = usage.get("total_tokens", 0) or 0
+
+        self.total_input_tokens += prompt_tokens
+        self.total_output_tokens += completion_tokens
+        self.llm_calls.append(LLMCallRecord(
+            call_type=call_type,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        ))
+
     def finish(self) -> None:
         """标记运行结束。"""
         self.end_time = time.monotonic()
@@ -84,12 +125,15 @@ class RunMetrics:
             + (" (达到上限)" if self.hit_max_iterations else "")
             + (" (检测到循环)" if self.loop_detected else ""),
             f"耗时: {self.duration_ms:.0f}ms",
-            f"工具调用: {self.tool_call_count} 次"
+            f"LLM调用: {self.llm_call_count}次"
+            + (f" (Token: {self.total_input_tokens}入/{self.total_output_tokens}出"
+               f"/{self.total_tokens}总)" if self.total_tokens > 0 else ""),
+            f"工具调用: {self.tool_call_count}次"
             + (f" (成功 {self.tool_success_count}, 失败 {self.tool_failure_count})"
                if self.tool_calls else ""),
         ]
         if self.kb_chunks_injected:
-            lines.append(f"知识库注入: {self.kb_chunks_injected} 条")
+            lines.append(f"知识库注入: {self.kb_chunks_injected}条")
         if self.memory_items_injected:
-            lines.append(f"记忆注入: {self.memory_items_injected} 条")
+            lines.append(f"记忆注入: {self.memory_items_injected}条")
         return " | ".join(lines)

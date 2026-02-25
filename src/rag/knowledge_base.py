@@ -81,12 +81,13 @@ class KnowledgeBase:
         doc = Document(content=text, metadata={"source": source, "filename": source})
         return self._index_document(doc)
 
-    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 3, relevance_threshold: float = 0.8) -> List[Dict[str, Any]]:
         """检索与查询最相关的知识片段。
 
         Args:
             query: 查询文本。
             top_k: 返回的最大结果数。
+            relevance_threshold: 相关度阈值（cosine distance），低于此值才认为相关。
 
         Returns:
             检索结果列表，每项包含 text, metadata, distance。
@@ -94,11 +95,11 @@ class KnowledgeBase:
         results = self._store.search(query, top_k=top_k)
 
         # 过滤掉相关度太低的结果
-        relevant = [r for r in results if r["distance"] < 1.2]
+        relevant = [r for r in results if r["distance"] < relevance_threshold]
 
         logger.debug(
-            "知识库检索 | query={} | 命中 {}/{} 条",
-            query[:50], len(relevant), len(results),
+            "知识库检索 | query={} | 命中 {}/{} 条 | threshold={}",
+            query[:50], len(relevant), len(results), relevance_threshold,
         )
         return relevant
 

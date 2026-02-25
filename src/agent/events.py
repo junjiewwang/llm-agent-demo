@@ -22,6 +22,7 @@ class EventType(str, Enum):
 
     THINKING = "thinking"  # LLM 开始思考（新一轮迭代）
     TOOL_CALL = "tool_call"  # 即将调用工具
+    TOOL_CONFIRM = "tool_confirm"  # 请求用户确认工具执行
     TOOL_RESULT = "tool_result"  # 工具执行完成
     ANSWERING = "answering"  # LLM 开始生成最终回答
     ERROR = "error"  # 执行出错
@@ -47,3 +48,4 @@ class AgentEvent:
     message: str = ""
     parallel_total: int = 0  # >1 表示该工具调用是并发批次的一部分，值为批次总数
     parallel_index: int = 0  # 该工具在并发批次中的序号（从 1 开始）
+    confirm_id: str = ""  # TOOL_CONFIRM 事件的唯一标识，用于前端回传确认结果

@@ -91,28 +91,25 @@ class ContextBuilder:
         self._knowledge_messages = [
             Message(
                 role=Role.SYSTEM,
-                content=(
-                    f"[知识库检索结果]\n{kb_text}\n\n"
-                    "以上是从知识库中检索到的相关内容，请优先基于这些内容回答用户问题。"
-                    "如果知识库内容不足以回答，再结合你自身的知识补充。"
-                ),
+                content=f"[知识库检索结果]\n{kb_text}",
             )
         ]
         logger.debug("ContextBuilder: 设置 {} 条知识库片段", len(results))
         return self
 
-    def set_memory(self, results: List[dict]) -> "ContextBuilder":
+    def set_memory(self, results: List[dict], relevance_threshold: float = 0.8) -> "ContextBuilder":
         """设置长期记忆检索结果（临时注入，不持久化）。
 
         Args:
             results: 长期记忆检索结果列表，每项含 'text' 和 'distance'。
+            relevance_threshold: 相关度阈值（cosine distance），低于此值才认为相关。
         """
         if not results:
             self._memory_messages = []
             return self
 
         # 过滤不相关结果 + 去重
-        relevant = [r for r in results if r.get("distance", 1.0) < 1.0]
+        relevant = [r for r in results if r.get("distance", 1.0) < relevance_threshold]
         seen_texts = set()
         unique_results = []
         for r in relevant:
@@ -129,10 +126,7 @@ class ContextBuilder:
         self._memory_messages = [
             Message(
                 role=Role.SYSTEM,
-                content=(
-                    f"[相关历史记忆]\n{memory_text}\n\n"
-                    "请参考以上记忆回答用户问题（如果相关的话）。"
-                ),
+                content=f"[相关历史记忆]\n{memory_text}",
             )
         ]
         logger.debug("ContextBuilder: 设置 {} 条长期记忆（去重后）", len(unique_results))
@@ -166,7 +160,7 @@ class ContextBuilder:
         env_text = " | ".join(f"{k}: {v}" for k, v in env_items.items())
         return Message(
             role=Role.SYSTEM,
-            content=f"[运行环境] {env_text}",
+            content=env_text,
         )
 
     def build(self, conversation_messages: List[Message]) -> List[Message]:

@@ -11,6 +11,9 @@ from src.tools.base_tool import ToolRegistry
 # 事件回调类型：接收 AgentEvent，无返回值
 OnEventCallback = Optional[Callable[[AgentEvent], None]]
 
+# 确认等待回调类型：接收 confirm_id，返回 True(批准)/False(拒绝)/None(超时)
+WaitForConfirmation = Optional[Callable[[str], Optional[bool]]]
+
 
 class BaseAgent(ABC):
     """Agent 抽象基类。
@@ -33,12 +36,18 @@ class BaseAgent(ABC):
         return self._memory
 
     @abstractmethod
-    def run(self, user_input: str, on_event: OnEventCallback = None) -> str:
+    def run(
+        self,
+        user_input: str,
+        on_event: OnEventCallback = None,
+        wait_for_confirmation: WaitForConfirmation = None,
+    ) -> str:
         """处理用户输入，返回最终回答。
 
         Args:
             user_input: 用户输入的文本。
             on_event: 可选的事件回调，用于实时传递思考过程。
+            wait_for_confirmation: 可选的确认等待回调，用于高风险工具执行前的用户审批。
 
         Returns:
             Agent 的最终回答文本。
