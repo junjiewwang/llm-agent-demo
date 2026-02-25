@@ -16,6 +16,8 @@ Zone 架构（从稳定到动态）：
 ├──────────────────────────────────────────────┤
 │ Environment Zone — 运行时环境信息（每次更新）  │
 ├──────────────────────────────────────────────┤
+│ Skill Zone       — 领域专家 prompt（按需注入） │
+├──────────────────────────────────────────────┤
 │ Inject Zone      — KB/长期记忆（按需临时注入） │
 ├──────────────────────────────────────────────┤
 │ History Zone     — 对话历史（动态）            │
@@ -23,10 +25,13 @@ Zone 架构（从稳定到动态）：
 """
 
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 from src.llm.base_client import Message, Role
 from src.utils.logger import logger
+
+if TYPE_CHECKING:
+    from src.skills.base import Skill
 
 # 环境变量提供者类型：返回 key→value 的字典
 EnvironmentProvider = Callable[[], Dict[str, str]]
@@ -50,6 +55,7 @@ class ContextBuilder:
         builder = ContextBuilder()
         messages = (
             builder
+            .set_skill(skill)
             .set_knowledge(kb_results)
             .set_memory(memory_results)
             .build(conversation_messages)
@@ -71,8 +77,30 @@ class ContextBuilder:
             environment_providers if environment_providers is not None
             else [default_environment]
         )
+        self._skill_messages: List[Message] = []
         self._knowledge_messages: List[Message] = []
         self._memory_messages: List[Message] = []
+
+    def set_skills(self, skills: List["Skill"]) -> "ContextBuilder":
+        """设置当前激活的 Skills（按需注入领域专家 prompt）。
+
+        Args:
+            skills: 匹配到的 Skill 列表（通常 0~2 个）。
+        """
+        if not skills:
+            self._skill_messages = []
+            return self
+
+        skill_prompts = "\n\n".join(s.system_prompt for s in skills)
+        self._skill_messages = [
+            Message(
+                role=Role.SYSTEM,
+                content=skill_prompts,
+            )
+        ]
+        skill_names = [s.name for s in skills]
+        logger.debug("ContextBuilder: 设置 {} 个 Skill: {}", len(skills), skill_names)
+        return self
 
     def set_knowledge(self, results: List[dict]) -> "ContextBuilder":
         """设置知识库检索结果（临时注入，不持久化）。
@@ -133,7 +161,8 @@ class ContextBuilder:
         return self
 
     def clear_injections(self) -> "ContextBuilder":
-        """清除所有临时注入（KB + 长期记忆），用于新一轮对话。"""
+        """清除所有临时注入（Skills + KB + 长期记忆），用于新一轮对话。"""
+        self._skill_messages = []
         self._knowledge_messages = []
         self._memory_messages = []
         return self
@@ -166,7 +195,7 @@ class ContextBuilder:
     def build(self, conversation_messages: List[Message]) -> List[Message]:
         """组装完整的 LLM 请求上下文。
 
-        Zone 顺序：System → Environment → Inject(KB + Memory) → History(对话历史)
+        Zone 顺序：System → Environment → Skill → Inject(KB + Memory) → History(对话历史)
 
         Args:
             conversation_messages: ConversationMemory 中的消息列表（含 system prompt）。
@@ -183,7 +212,7 @@ class ContextBuilder:
             else:
                 history_msgs.append(msg)
 
-        # Zone 组装：System → Environment → KB → Memory → History
+        # Zone 组装：System → Environment → Skill → KB → Memory → History
         result = []
         result.extend(system_msgs)                   # System Zone（稳定前缀）
 
@@ -191,14 +220,16 @@ class ContextBuilder:
         if env_msg:
             result.append(env_msg)
 
+        result.extend(self._skill_messages)           # Skill Zone（领域专家）
         result.extend(self._knowledge_messages)       # Inject Zone - KB
         result.extend(self._memory_messages)          # Inject Zone - Memory
         result.extend(history_msgs)                   # History Zone（动态）
 
+        skill_count = len(self._skill_messages)
         inject_count = len(self._knowledge_messages) + len(self._memory_messages)
         env_count = 1 if env_msg else 0
         logger.debug(
-            "ContextBuilder.build | system={} env={} inject={} history={} total={}",
-            len(system_msgs), env_count, inject_count, len(history_msgs), len(result),
+            "ContextBuilder.build | system={} env={} skill={} inject={} history={} total={}",
+            len(system_msgs), env_count, skill_count, inject_count, len(history_msgs), len(result),
         )
         return result

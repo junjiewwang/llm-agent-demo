@@ -42,6 +42,7 @@ from src.utils.logger import logger
 
 if TYPE_CHECKING:
     from src.rag.knowledge_base import KnowledgeBase
+    from src.skills.router import SkillRouter
 
 _tracer = get_tracer(__name__)
 
@@ -68,6 +69,7 @@ class ReActAgent(BaseAgent):
         context_builder: ContextBuilder,
         vector_store: Optional[VectorStore] = None,
         knowledge_base: Optional["KnowledgeBase"] = None,
+        skill_router: Optional["SkillRouter"] = None,
         max_iterations: Optional[int] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -76,6 +78,7 @@ class ReActAgent(BaseAgent):
         self._context_builder = context_builder
         self._vector_store = vector_store
         self._knowledge_base = knowledge_base
+        self._skill_router = skill_router
         self._max_iterations = max_iterations or settings.agent.max_iterations
         self._temperature = temperature or settings.agent.temperature
         self._max_tokens = max_tokens or settings.agent.max_tokens
@@ -164,8 +167,10 @@ class ReActAgent(BaseAgent):
         self._inject_knowledge(user_input, metrics)
         # 2. 检索长期记忆，通过 ContextBuilder 临时注入
         self._inject_long_term_memory(user_input, metrics)
+        # 3. 匹配并注入 Skills（领域专家 prompt）
+        self._inject_skills(user_input)
 
-        # 3. 用户消息写入对话历史（这是真正应该持久化的）
+        # 4. 用户消息写入对话历史（这是真正应该持久化的）
         self._memory.add_user_message(user_input)
 
         tools_schema = self._tools.to_openai_tools() if len(self._tools) > 0 else None
@@ -301,6 +306,24 @@ class ReActAgent(BaseAgent):
             if relevant:
                 metrics.memory_items_injected = len(relevant)
                 logger.info("注入 {} 条长期记忆（threshold={}）", len(relevant), threshold)
+
+    def _inject_skills(self, user_input: str) -> None:
+        """根据用户意图匹配 Skills，通过 ContextBuilder 临时注入领域专家 prompt。
+
+        Skills 在每次对话开始时匹配一次，注入后在整个 ReAct 循环中持续生效。
+        """
+        if not self._skill_router:
+            self._context_builder.set_skills([])
+            return
+
+        matches = self._skill_router.match(user_input)
+        if matches:
+            skills = [m.skill for m in matches]
+            self._context_builder.set_skills(skills)
+            skill_names = [f"{m.skill.display_name}({m.score:.2f})" for m in matches]
+            logger.info("激活 Skills: {}", ", ".join(skill_names))
+        else:
+            self._context_builder.set_skills([])
 
     def _store_to_long_term_memory(self, user_input: str, answer: str,
                                    metrics: Optional[RunMetrics] = None) -> None:
