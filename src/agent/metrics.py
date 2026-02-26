@@ -118,6 +118,17 @@ class RunMetrics:
         """标记运行结束。"""
         self.end_time = time.monotonic()
 
+    def usage_summary(self) -> dict:
+        """生成消息级 token 用量摘要（供前端展示）。"""
+        return {
+            "input_tokens": self.total_input_tokens,
+            "output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_tokens,
+            "llm_calls": self.llm_call_count,
+            "tool_calls": self.tool_call_count,
+            "duration_ms": round(self.duration_ms),
+        }
+
     def summary(self) -> str:
         """生成可读的运行摘要。"""
         lines = [

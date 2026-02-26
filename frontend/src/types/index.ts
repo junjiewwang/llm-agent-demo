@@ -64,6 +64,16 @@ export interface ToolConfirmEvent {
   tool_args: Record<string, unknown>
 }
 
+/** 消息级 token 用量 */
+export interface MessageUsage {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  llm_calls: number
+  tool_calls: number
+  duration_ms: number
+}
+
 /** 完成事件 */
 export interface DoneEvent {
   type: 'done'
@@ -72,6 +82,7 @@ export interface DoneEvent {
   chat_history: ChatMessage[]
   conversations: ConversationInfo[]
   status: StatusInfo
+  usage?: MessageUsage
 }
 
 /** 聊天过程中的 SSE 事件联合类型 */
@@ -90,6 +101,8 @@ export interface ChatMessage {
   content: string
   /** 关联的思考过程（仅 assistant 消息，聊天完成后快照） */
   thinkingNodes?: ThinkingNode[]
+  /** 本次回答的 token 用量（仅 assistant 消息，聊天完成后填充） */
+  usage?: MessageUsage
 }
 
 /** 对话信息 */

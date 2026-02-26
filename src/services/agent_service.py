@@ -25,6 +25,7 @@ from typing import Dict, Generator, List, Optional, Union
 
 from src.agent.events import AgentEvent, AgentStoppedError, EventType
 from src.commands import CommandContext, CommandRegistry
+from src.config import settings
 from src.factory import (
     SharedComponents,
     TenantSession,
@@ -52,6 +53,9 @@ class ChatResult:
 
     error: Optional[str] = None
     """执行错误信息（如果有）。"""
+
+    usage: Optional[Dict] = None
+    """本次回答的 token 用量摘要（message_usage_enabled 开启时填充）。"""
 
 
 # chat() 生成器 yield 的联合类型：过程中 yield AgentEvent，最终 yield ChatResult
@@ -390,14 +394,20 @@ class AgentService:
         self._stop_events.pop(tenant_id, None)
 
         # 构造最终结果
+        usage = None
+        if settings.agent.message_usage_enabled:
+            metrics = getattr(conv.agent, 'last_metrics', None)
+            if metrics:
+                usage = metrics.usage_summary()
+
         if stopped or isinstance(result_holder[1], AgentStoppedError):
             logger.info("对话已被用户停止 | tenant={}", tenant_id[:8])
-            result = ChatResult(content="", stopped=True)
+            result = ChatResult(content="", stopped=True, usage=usage)
         elif result_holder[1]:
             logger.error("Agent 执行失败: {}", result_holder[1])
-            result = ChatResult(content="", error=str(result_holder[1]))
+            result = ChatResult(content="", error=str(result_holder[1]), usage=usage)
         else:
-            result = ChatResult(content=result_holder[0] or "")
+            result = ChatResult(content=result_holder[0] or "", usage=usage)
 
         # 将 Agent 回答写入 chat_history 并持久化
         if result.content:

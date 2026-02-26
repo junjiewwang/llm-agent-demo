@@ -37,6 +37,11 @@ class AgentSettings(BaseSettings):
     memory_relevance_threshold: float = 0.7
     tool_confirm_mode: str = "smart"
 
+    # ── 3.0 演进开关（默认关闭，不影响现有行为） ──
+    message_usage_enabled: bool = True  # 前端展示消息级 token 消耗
+    policy_enabled: bool = False  # 工具策略重排（Sprint 2）
+    memory_governor_enabled: bool = False  # 长期记忆治理（Sprint 3）
+
     model_config = SettingsConfigDict(
         env_prefix="AGENT_",
         env_file=".env",

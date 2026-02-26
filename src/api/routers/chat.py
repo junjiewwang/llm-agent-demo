@@ -88,6 +88,10 @@ def _chat_result_to_sse(result: ChatResult, service: AgentService, tenant_id: st
         "status": service.get_status(tenant_id),
     }
 
+    # 消息级 token 用量（feature flag 控制）
+    if result.usage:
+        data["usage"] = result.usage
+
     # 获取当前对话的 chat_history
     tenant = service._tenants.get(tenant_id)
     if tenant:

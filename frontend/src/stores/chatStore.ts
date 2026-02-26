@@ -66,13 +66,17 @@ export const useChatStore = create<ChatState>((set) => ({
       },
 
       onDone: (data) => {
-        // 将思考过程快照附加到最后一条 assistant 消息
+        // 将思考过程快照和 usage 附加到最后一条 assistant 消息
         const currentNodes = useChatStore.getState().thinkingNodes
         const history = [...data.chat_history]
-        if (currentNodes.length > 0) {
+        if (currentNodes.length > 0 || data.usage) {
           for (let i = history.length - 1; i >= 0; i--) {
             if (history[i].role === 'assistant') {
-              history[i] = { ...history[i], thinkingNodes: currentNodes }
+              history[i] = {
+                ...history[i],
+                ...(currentNodes.length > 0 ? { thinkingNodes: currentNodes } : {}),
+                ...(data.usage ? { usage: data.usage } : {}),
+              }
               break
             }
           }

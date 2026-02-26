@@ -3,8 +3,9 @@
  *
  * assistant 消息如果关联了思考过程（thinkingNodes），
  * 会在回答上方显示可折叠的 ThinkingPanel（默认收起）。
+ * assistant 消息如果携带 usage，会在气泡底部显示 token 用量。
  */
-import type { ChatMessage } from '../../types'
+import type { ChatMessage, MessageUsage } from '../../types'
 import MarkdownRenderer from './MarkdownRenderer'
 import ThinkingPanel from './ThinkingPanel'
 
@@ -14,6 +15,25 @@ interface Props {
 
 /** 系统提示类消息（如 [对话已停止]），居中灰色小字 */
 const SYSTEM_HINTS = new Set(['[对话已停止]'])
+
+/** 格式化 token 数字（千位分隔） */
+function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+/** token 用量展示条 */
+function UsageBar({ usage }: { usage: MessageUsage }) {
+  return (
+    <div className="flex items-center gap-3 mt-1.5 px-1 text-[11px] text-gray-400 dark:text-gray-500 select-none">
+      <span title="输入 Token">↑{formatTokens(usage.input_tokens)}</span>
+      <span title="输出 Token">↓{formatTokens(usage.output_tokens)}</span>
+      <span title="总计 Token">Σ{formatTokens(usage.total_tokens)}</span>
+      {usage.duration_ms > 0 && (
+        <span title="耗时">{(usage.duration_ms / 1000).toFixed(1)}s</span>
+      )}
+    </div>
+  )
+}
 
 export default function MessageBubble({ message }: Props) {
   const isUser = message.role === 'user'
@@ -63,6 +83,9 @@ export default function MessageBubble({ message }: Props) {
             </div>
           )}
         </div>
+
+        {/* Token 用量（仅 assistant 消息，完成后显示） */}
+        {!isUser && message.usage && <UsageBar usage={message.usage} />}
       </div>
     </div>
   )
