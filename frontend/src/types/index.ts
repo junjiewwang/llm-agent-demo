@@ -165,6 +165,19 @@ export interface UploadData {
   error?: string
 }
 
+export interface TokenResponse {
+  access_token: string
+  token_type: string
+  user_id: string
+  username: string
+}
+
+export interface UserInfo {
+  id: string
+  username: string
+  created_at: number
+}
+
 /** ThinkingPanel 树节点（预留 children 用于 Plan-and-Execute） */
 export interface ThinkingNode {
   id: string

@@ -19,3 +19,5 @@ opentelemetry-sdk>=1.25.0
 opentelemetry-exporter-otlp>=1.25.0
 opentelemetry-instrumentation-fastapi>=0.46b0
 pyyaml>=6.0
+pyjwt>=2.8.0
+passlib>=1.7.4

@@ -1,10 +1,15 @@
 /**
  * 顶部导航栏
  */
+import { useState } from 'react'
 import { useUIStore } from '../../stores/uiStore'
+import { useSessionStore } from '../../stores/sessionStore'
+import LoginModal from '../auth/LoginModal'
 
 export default function Header() {
   const { toggleSidebarCollapse, toggleStatusPanel } = useUIStore()
+  const { user, logout } = useSessionStore()
+  const [isLoginOpen, setIsLoginOpen] = useState(false)
 
   return (
     <header className="h-14 flex-shrink-0 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between px-4">
@@ -24,7 +29,38 @@ export default function Header() {
         </h1>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-4">
+        {/* 用户信息与登录按钮 */}
+        <div className="flex items-center gap-2">
+          {user ? (
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                {user.username}
+              </span>
+              <button
+                onClick={() => {
+                  if (confirm('确定要退出登录吗？')) {
+                    logout()
+                    window.location.reload()
+                  }
+                }}
+                className="text-xs px-2 py-1 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-400 rounded transition-colors"
+              >
+                退出
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setIsLoginOpen(true)}
+              className="text-sm px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium shadow-sm"
+            >
+              登录 / 注册
+            </button>
+          )}
+        </div>
+
+        <div className="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-1" />
+
         <button
           onClick={toggleStatusPanel}
           className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-400 transition-colors"
@@ -35,6 +71,8 @@ export default function Header() {
           </svg>
         </button>
       </div>
+
+      <LoginModal isOpen={isLoginOpen} onClose={() => setIsLoginOpen(false)} />
     </header>
   )
 }

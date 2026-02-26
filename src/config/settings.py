@@ -187,6 +187,26 @@ class SkillSettings(BaseSettings):
     )
 
 
+class AuthSettings(BaseSettings):
+    """认证配置。
+
+    环境变量前缀: AUTH_
+    - AUTH_SECRET_KEY: JWT 签名密钥
+    - AUTH_ALGORITHM: 签名算法（默认 HS256）
+    - AUTH_ACCESS_TOKEN_EXPIRE_MINUTES: Token 有效期（分钟）
+    """
+    secret_key: str = "your-secret-key-please-change-in-production"
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 10080  # 7 days
+
+    model_config = SettingsConfigDict(
+        env_prefix="AUTH_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class Settings:
     """全局配置聚合，各子配置独立加载 .env。"""
 
@@ -198,6 +218,7 @@ class Settings:
         self.devops = DevOpsSettings()
         self.otel = OtelSettings()
         self.skills = SkillSettings()
+        self.auth = AuthSettings()
 
 
 settings = Settings()

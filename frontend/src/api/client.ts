@@ -9,24 +9,67 @@ import type {
   ConversationInfo,
   StatusInfo,
   UploadData,
-} from '../types'
+  TokenResponse,
+  UserInfo,
+} from '../types/index'
+
+import { useSessionStore } from '../stores/sessionStore'
 
 const BASE_URL = '/api'
 
 async function request<T>(
   path: string,
   options: RequestInit = {},
-): Promise<ApiResponse<T>> {
+): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string>),
+  }
+
+  // 自动注入 JWT Token
+  const token = useSessionStore.getState().token
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
   const response = await fetch(`${BASE_URL}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers as Record<string, string> },
     ...options,
+    headers,
   })
 
+  if (response.status === 401) {
+    useSessionStore.getState().logout()
+    // throw new Error('Unauthorized') // 让调用方处理
+  }
+
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    const errorData = await response.json().catch(() => ({}))
+    const errorMessage = errorData.detail || errorData.error || response.statusText
+    throw new Error(errorMessage)
   }
 
   return response.json()
+}
+
+/** 注册 */
+export async function register(username: string, password: string): Promise<ApiResponse<TokenResponse>> {
+  return request('/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  })
+}
+
+/** 登录 */
+export async function login(username: string, password: string): Promise<ApiResponse<TokenResponse>> {
+  return request('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  })
+}
+
+/** 获取当前用户信息 */
+export async function getMe(): Promise<ApiResponse<UserInfo>> {
+  return request('/auth/me')
 }
 
 /** 恢复会话 */

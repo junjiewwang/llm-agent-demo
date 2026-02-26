@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from src.api.dependencies import get_service
-from src.api.routers import chat, session, knowledge, status
+from src.api.routers import chat, session, knowledge, status, auth
 from src.observability import init_telemetry, shutdown_telemetry
 from src.utils.logger import logger
 
@@ -61,6 +61,7 @@ def create_app() -> FastAPI:
     )
 
     # 注册 API 路由
+    app.include_router(auth.router, prefix="/api", tags=["认证"])
     app.include_router(session.router, prefix="/api", tags=["会话管理"])
     app.include_router(chat.router, prefix="/api", tags=["聊天"])
     app.include_router(knowledge.router, prefix="/api", tags=["知识库"])

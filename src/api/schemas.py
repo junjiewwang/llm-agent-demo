@@ -112,3 +112,25 @@ class UploadData(BaseModel):
     results: List[UploadResultItem] = Field(default_factory=list)
     total_chunks: int = 0
     error: Optional[str] = None
+
+
+class AuthRequest(BaseModel):
+    """用户认证请求（注册/登录）。"""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6, max_length=100)
+
+
+class TokenResponse(BaseModel):
+    """Token 响应。"""
+    access_token: str
+    token_type: str = "bearer"
+    user_id: str
+    username: str
+
+
+class UserInfo(BaseModel):
+    """用户信息。"""
+    id: str
+    username: str
+    created_at: float
+
