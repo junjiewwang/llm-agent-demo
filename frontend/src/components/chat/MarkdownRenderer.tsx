@@ -10,7 +10,7 @@
  * - 工具栏：代码/图表切换、放大/缩小、下载 SVG
  * - 点击放大：全屏 Modal 查看大图
  */
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import mermaid from 'mermaid'
@@ -28,21 +28,21 @@ let currentThemeKey: string | null = null
 /** 柔和暗色调色板（参考截图风格：深底 + 淡色细线 + 柔和文字） */
 const DARK_THEME_VARS = {
   // 全局文字：柔和浅灰，不刺眼
-  primaryTextColor: '#c8d6e5',
-  secondaryTextColor: '#a0aec0',
-  tertiaryTextColor: '#8899a6',
+  primaryTextColor: '#d2deea',
+  secondaryTextColor: '#b7c5d6',
+  tertiaryTextColor: '#93a6ba',
   // 节点：深色填充 + 淡色细边框
   primaryColor: '#1a2332',
-  primaryBorderColor: '#3d5a80',
+  primaryBorderColor: '#5b7da2',
   secondaryColor: '#162029',
-  // 连线：与边框同色系，柔和统一
-  lineColor: '#4a6785',
-  textColor: '#c8d6e5',
+  // 连线：提高暗色下对比度
+  lineColor: '#7a9dc2',
+  textColor: '#d2deea',
   // 背景
   mainBkg: '#1a2332',
-  nodeBorder: '#3d5a80',
-  // 边标签
-  edgeLabelBackground: 'transparent',
+  nodeBorder: '#5b7da2',
+  // 边标签：避免透明导致暗底可读性差
+  edgeLabelBackground: '#0f1923cc',
   // 序列图
   actorTextColor: '#c8d6e5',
   actorBkg: '#1a2332',
@@ -80,6 +80,7 @@ function ensureMermaidInit() {
       theme: 'base',
       securityLevel: 'loose',
       fontFamily: 'system-ui, -apple-system, sans-serif',
+      fontSize: 14,
       themeVariables: {
         ...DARK_THEME_VARS,
         background: '#0f1923',
@@ -91,6 +92,7 @@ function ensureMermaidInit() {
       theme: 'default',
       securityLevel: 'loose',
       fontFamily: 'system-ui, -apple-system, sans-serif',
+      fontSize: 14,
     })
   }
   currentThemeKey = key
@@ -103,6 +105,56 @@ function ensureMermaidInit() {
  * 组件滚出视口被卸载 → 滚回来重挂载 → 直接读缓存，不重新调用 mermaid.render()
  */
 const svgCache = new Map<string, string>()
+
+/** 图表 UI 状态缓存（tab/zoom/mode），防止虚拟滚动卸载重挂载丢失交互状态 */
+interface DiagramUiState {
+  tab: 'chart' | 'code'
+  zoom: number
+  zoomMode: 'auto' | 'manual'
+  fitVersion: number
+}
+const diagramUiCache = new Map<string, DiagramUiState>()
+
+/** fit 策略版本号，每次调参 +1，可让旧缓存中的 auto 模式重新 fit */
+const FIT_VERSION = 3
+
+/**
+ * 阅读基线缩放比：定义"用户体感 100%"对应的内部 actualZoom 值。
+ * 即 actualZoom=0.5 时，UI 显示为 100%。
+ */
+const BASE_READING_ZOOM = 0.5
+
+const MIN_ZOOM = 0.25
+const MAX_ZOOM = 1.5
+const ZOOM_STEP = 0.05
+
+/** 首屏 fit 缩放参数 */
+const FIT_TARGET_PX = 560
+const FIT_TARGET_HEIGHT_PX = 420
+const FIT_MIN = 0.35
+const FIT_MAX = 0.5
+
+/** 内部 actualZoom → 用户展示百分比 */
+function toDisplayPercent(actualZoom: number): number {
+  return Math.round((actualZoom / BASE_READING_ZOOM) * 100)
+}
+
+/** 从 SVG viewBox 解析原始宽高 */
+function parseSvgViewBoxSize(svgStr: string): { width: number; height: number } | null {
+  const match = svgStr.match(/viewBox=["'][\d.e+-]+\s+[\d.e+-]+\s+([\d.e+-]+)\s+([\d.e+-]+)["']/i)
+  if (!match) return null
+  const width = parseFloat(match[1])
+  const height = parseFloat(match[2])
+  return (isFinite(width) && isFinite(height)) ? { width, height } : null
+}
+
+/** 根据 SVG 原始宽高计算首屏适配缩放比（宽高双约束） */
+function calcInitialFitZoom(svgWidth: number, svgHeight: number): number {
+  const fitW = FIT_TARGET_PX / svgWidth
+  const fitH = FIT_TARGET_HEIGHT_PX / svgHeight
+  const fit = Math.min(fitW, fitH, 1)
+  return Math.min(Math.max(fit, FIT_MIN), FIT_MAX)
+}
 
 /** 全局递增 ID，确保多个 Mermaid 块不冲突 */
 let mermaidIdCounter = 0
@@ -133,15 +185,31 @@ async function renderMermaidSvg(code: string): Promise<string> {
  * 使 SVG 能自适应容器大小。
  */
 function makeResponsiveSvg(rawSvg: string): string {
-  return rawSvg
-    // 移除 style 中的 max-width 限制
-    .replace(/style="[^"]*"/i, (match) =>
-      match.replace(/max-width:\s*[\d.]+px;?/gi, '').replace(/\s*;?\s*"/, '"')
-    )
-    // 移除 SVG 标签上的固定 width 属性（保留 viewBox）
-    .replace(/(<svg[^>]*?)\s+width="[\d.]+(px)?"/i, '$1')
-    // 移除 SVG 标签上的固定 height 属性
-    .replace(/(<svg[^>]*?)\s+height="[\d.]+(px)?"/i, '$1')
+  return rawSvg.replace(/<svg\b([^>]*)>/i, (_, rawAttrs: string) => {
+    // 移除根节点上的固定宽高属性
+    const attrsWithoutSize = rawAttrs.replace(/\s(?:width|height)=(['"])[^'"]*\1/gi, '')
+
+    // 拆出 style，去掉其中的宽高/最大宽高约束，再注入响应式样式
+    const styleMatch = attrsWithoutSize.match(/\sstyle=(['"])(.*?)\1/i)
+    const existingStyle = styleMatch?.[2] ?? ''
+    const attrsWithoutStyle = attrsWithoutSize.replace(/\sstyle=(['"])(.*?)\1/i, '')
+
+    const cleanedStyle = existingStyle
+      .split(';')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .filter((item) => !/^(width|height|max-width|max-height)\s*:/i.test(item))
+
+    const mergedStyle = [
+      ...cleanedStyle,
+      'width: 100%',
+      'height: auto',
+      'max-width: none',
+      'display: block',
+    ].join('; ')
+
+    return `<svg${attrsWithoutStyle} style="${mergedStyle}">`
+  })
 }
 
 function DiagramModal({ svg, onClose }: { svg: string; onClose: () => void }) {
@@ -236,20 +304,29 @@ function IconExpand() {
 }
 
 /** 工具栏按钮 */
-function ToolbarBtn({ onClick, title, active, children }: {
-  onClick: () => void; title: string; active?: boolean; children: React.ReactNode
+function ToolbarBtn({ onClick, title, active, disabled, label, children }: {
+  onClick: () => void
+  title: string
+  active?: boolean
+  disabled?: boolean
+  label?: string
+  children: React.ReactNode
 }) {
   return (
     <button
       onClick={onClick}
       title={title}
-      className={`p-1.5 rounded transition-colors ${
+      disabled={disabled}
+      className={`flex items-center gap-1.5 px-2 py-1.5 rounded transition-colors text-xs ${
         active
-          ? 'text-blue-400 bg-blue-500/10'
-          : 'text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/50'
+          ? 'text-blue-500 bg-blue-500/10'
+          : disabled
+            ? 'text-gray-300 dark:text-gray-600 cursor-not-allowed'
+            : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700/50'
       }`}
     >
       {children}
+      {label && <span>{label}</span>}
     </button>
   )
 }
@@ -287,12 +364,19 @@ function downloadSvg(svgContent: string) {
 
 /** Mermaid 图表渲染组件（带缓存 + 工具栏 + 暗色模式 + 点击放大） */
 function MermaidBlock({ code }: { code: string }) {
-  const [svg, setSvg] = useState<string>(() => svgCache.get(code.trim()) ?? '')
+  const diagramKey = useMemo(() => code.trim(), [code])
+  const cachedUi = diagramUiCache.get(diagramKey)
+
+  const [svg, setSvg] = useState<string>(() => svgCache.get(diagramKey) ?? '')
   const [error, setError] = useState<string | null>(null)
   const [showModal, setShowModal] = useState(false)
-  const [tab, setTab] = useState<'chart' | 'code'>('chart')
-  const [zoom, setZoom] = useState(1)
+  const [tab, setTab] = useState<'chart' | 'code'>(cachedUi?.tab ?? 'chart')
+  const [zoom, setZoom] = useState(cachedUi?.zoom ?? BASE_READING_ZOOM)
+  const [zoomMode, setZoomMode] = useState<'auto' | 'manual'>(cachedUi?.zoomMode ?? 'auto')
+  /** 用户是否手动缩放过（一旦为 true 则不再自动 fit） */
+  const hasUserZoomedRef = useRef(cachedUi?.zoomMode === 'manual')
 
+  // 异步渲染 SVG
   useEffect(() => {
     if (svg) return
     let cancelled = false
@@ -303,10 +387,44 @@ function MermaidBlock({ code }: { code: string }) {
     return () => { cancelled = true }
   }, [code, svg])
 
-  const responsiveSvg = useMemo(() => svg ? makeResponsiveSvg(svg) : '', [svg])
+  // 首屏自适配缩放：首次渲染 / fit 策略版本升级时触发
+  useEffect(() => {
+    if (!svg || hasUserZoomedRef.current) return
+    // 有缓存且 zoomMode=manual -> 不动
+    if (cachedUi && cachedUi.zoomMode === 'manual') return
+    // 有缓存且 fitVersion 未变 -> 不重算
+    if (cachedUi && cachedUi.fitVersion === FIT_VERSION) return
 
-  const handleZoomIn = useCallback(() => setZoom((z) => Math.min(z + 0.25, 3)), [])
-  const handleZoomOut = useCallback(() => setZoom((z) => Math.max(z - 0.25, 0.5)), [])
+    const size = parseSvgViewBoxSize(svg)
+    if (size && (size.width > FIT_TARGET_PX || size.height > FIT_TARGET_HEIGHT_PX)) {
+      const fitZoom = calcInitialFitZoom(size.width, size.height)
+      setZoom(Math.min(fitZoom, BASE_READING_ZOOM))
+      setZoomMode('auto')
+    }
+  }, [svg, cachedUi])
+
+  // 缓存写回
+  useEffect(() => {
+    diagramUiCache.set(diagramKey, { tab, zoom, zoomMode, fitVersion: FIT_VERSION })
+  }, [diagramKey, tab, zoom, zoomMode])
+
+  const responsiveSvg = useMemo(() => svg ? makeResponsiveSvg(svg) : '', [svg])
+  const displayPercent = toDisplayPercent(zoom)
+  const canZoomIn = zoom < MAX_ZOOM - 1e-6
+  const canZoomOut = zoom > MIN_ZOOM + 1e-6
+
+  const handleZoomIn = useCallback(() => {
+    if (!canZoomIn) return
+    hasUserZoomedRef.current = true
+    setZoomMode('manual')
+    setZoom((z) => Math.min(z + ZOOM_STEP, MAX_ZOOM))
+  }, [canZoomIn])
+  const handleZoomOut = useCallback(() => {
+    if (!canZoomOut) return
+    hasUserZoomedRef.current = true
+    setZoomMode('manual')
+    setZoom((z) => Math.max(z - ZOOM_STEP, MIN_ZOOM))
+  }, [canZoomOut])
   const handleExpand = useCallback(() => { if (svg) setShowModal(true) }, [svg])
   const handleDownload = useCallback(() => { if (svg) downloadSvg(svg) }, [svg])
 
@@ -333,9 +451,9 @@ function MermaidBlock({ code }: { code: string }) {
 
   return (
     <>
-      <div className="my-2 border border-gray-200 dark:border-gray-700/50 rounded-lg overflow-hidden bg-white dark:bg-[#0f1923]">
+      <div className="my-2 max-w-[760px] border border-gray-200/60 dark:border-gray-700/30 rounded-lg overflow-hidden bg-white dark:bg-[#0f1923]">
         {/* 工具栏 */}
-        <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-100 dark:border-gray-700/50 bg-gray-50 dark:bg-[#131f2e]">
+        <div className="flex items-center justify-between px-3 py-1 border-b border-gray-100/80 dark:border-gray-700/40 bg-gray-50/80 dark:bg-[#131f2e]/80">
           <div className="flex items-center gap-1">
             <TabBtn active={tab === 'code'} onClick={() => setTab('code')}>
               <span className="flex items-center gap-1"><IconCode />代码</span>
@@ -345,22 +463,62 @@ function MermaidBlock({ code }: { code: string }) {
             </TabBtn>
           </div>
           {tab === 'chart' && (
-            <div className="flex items-center gap-0.5">
-              <ToolbarBtn onClick={handleZoomOut} title="缩小"><IconZoomOut /></ToolbarBtn>
-              <ToolbarBtn onClick={handleZoomIn} title="放大"><IconZoomIn /></ToolbarBtn>
-              <ToolbarBtn onClick={handleExpand} title="全屏查看"><IconExpand /></ToolbarBtn>
-              <ToolbarBtn onClick={handleDownload} title="下载 SVG"><IconDownload /></ToolbarBtn>
+            <div className="flex items-center gap-1">
+              <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">{displayPercent}%</span>
+              <ToolbarBtn onClick={handleZoomOut} title="缩小" disabled={!canZoomOut} label="缩小"><IconZoomOut /></ToolbarBtn>
+              <ToolbarBtn onClick={handleZoomIn} title="放大" disabled={!canZoomIn} label="放大"><IconZoomIn /></ToolbarBtn>
+              <ToolbarBtn onClick={handleExpand} title="全屏查看" label="全屏"><IconExpand /></ToolbarBtn>
+              <ToolbarBtn onClick={handleDownload} title="下载 SVG" label="下载"><IconDownload /></ToolbarBtn>
             </div>
           )}
         </div>
         {/* 内容区 */}
         {tab === 'chart' ? (
-          <div className="overflow-auto p-4">
-            <div
-              className="flex justify-center [&>svg]:h-auto transition-transform origin-top"
-              style={{ transform: `scale(${zoom})`, transformOrigin: 'top center' }}
-              dangerouslySetInnerHTML={{ __html: responsiveSvg }}
-            />
+          <div className="relative group overflow-auto p-2">
+            <div className="flex justify-start">
+              <div
+                className="transition-[width] duration-200 ease-out [&>svg]:w-full [&>svg]:h-auto [&>svg]:max-w-none"
+                style={{ width: `${zoom * 100}%` }}
+                dangerouslySetInnerHTML={{ __html: responsiveSvg }}
+              />
+            </div>
+            {/* 悬浮操作条 */}
+            <div className="pointer-events-none absolute bottom-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="pointer-events-auto flex items-center gap-1 rounded-full bg-white/90 dark:bg-[#0f1923]/90 border border-gray-200/70 dark:border-gray-700/60 shadow-sm px-2 py-1">
+                <span className="text-[11px] text-gray-500 dark:text-gray-400 tabular-nums">{displayPercent}%</span>
+                <button
+                  onClick={handleZoomOut}
+                  disabled={!canZoomOut}
+                  title="缩小"
+                  className={`p-1 rounded ${
+                    canZoomOut
+                      ? 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'
+                      : 'text-gray-300 dark:text-gray-600 cursor-not-allowed'
+                  }`}
+                >
+                  <IconZoomOut />
+                </button>
+                <button
+                  onClick={handleZoomIn}
+                  disabled={!canZoomIn}
+                  title="放大"
+                  className={`p-1 rounded ${
+                    canZoomIn
+                      ? 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'
+                      : 'text-gray-300 dark:text-gray-600 cursor-not-allowed'
+                  }`}
+                >
+                  <IconZoomIn />
+                </button>
+                <button
+                  onClick={handleExpand}
+                  title="全屏查看"
+                  className="p-1 rounded text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                >
+                  <IconExpand />
+                </button>
+              </div>
+            </div>
           </div>
         ) : (
           <pre className="bg-gray-900 dark:bg-[#0c1520] text-gray-300 p-4 overflow-x-auto text-sm m-0 rounded-none">
@@ -401,7 +559,7 @@ export default function MarkdownRenderer({ content }: Props) {
           // Mermaid 代码块：渲染为 SVG 图表
           if (match && match[1] === 'mermaid') {
             const code = String(children).replace(/\n$/, '')
-            return <MermaidBlock code={code} />
+            return <div className="mermaid-diagram-wrapper"><MermaidBlock code={code} /></div>
           }
 
           return (

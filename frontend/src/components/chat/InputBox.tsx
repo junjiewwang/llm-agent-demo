@@ -14,7 +14,7 @@ interface Props {
 }
 
 /** 自动伸缩的上限（px），超出后需手动拖拽 */
-const AUTO_GROW_MAX = 240
+const AUTO_GROW_MAX = 200
 
 export default function InputBox({ onSend, onStop, isStreaming, disabled }: Props) {
   const [input, setInput] = useState('')
@@ -72,7 +72,7 @@ export default function InputBox({ onSend, onStop, isStreaming, disabled }: Prop
 
   return (
     <div className="bg-white dark:bg-gray-900 px-4 pb-4 pt-2">
-      <div className="max-w-4xl mx-auto">
+      <div className="max-w-6xl mx-auto">
         {/* 卡片容器 */}
         <div className="relative rounded-2xl border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 shadow-lg focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-transparent transition">
           {/* textarea */}
@@ -93,7 +93,7 @@ export default function InputBox({ onSend, onStop, isStreaming, disabled }: Prop
           {/* 底部操作栏：绝对定位在 textarea 内部底部 */}
           <div className="absolute bottom-2 left-3 right-3 flex items-center justify-between pointer-events-none">
             {/* 左侧提示 */}
-            <span className="text-xs text-gray-400 select-none">
+            <span className="text-[11px] text-gray-400/70 select-none">
               Shift+Enter 换行
             </span>
 

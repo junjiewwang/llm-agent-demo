@@ -29,9 +29,19 @@ export default function MessageBubble({ message }: Props) {
     )
   }
 
+  // 判断是否包含 Mermaid 图表（用于内层宽度分类）
+  const hasMermaid = !isUser && /```mermaid\b/.test(message.content)
+
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
-      <div className={`max-w-[80%] ${isUser ? '' : 'space-y-2'}`}>
+      {/* 外层：assistant 固定宽度防缩放抖动；user 保持内容驱动 */}
+      <div className={
+        isUser
+          ? 'max-w-[80%]'
+          : hasMermaid
+            ? 'w-full max-w-[84%] space-y-2'
+            : 'w-full max-w-[78%] space-y-2'
+      }>
         {/* 思考过程：仅 assistant 消息，在回答上方，默认收起 */}
         {!isUser && message.thinkingNodes && message.thinkingNodes.length > 0 && (
           <ThinkingPanel nodes={message.thinkingNodes} defaultExpanded={false} />

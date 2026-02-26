@@ -111,12 +111,9 @@ export default function ChatView() {
       {/* 消息区域 */}
       <div className="flex-1 overflow-hidden">
         {messages.length === 0 && !isStreaming ? (
-          <div className="h-full flex items-center justify-center">
-            <div className="text-center text-gray-400 dark:text-gray-600">
-              <div className="text-5xl mb-4">🤖</div>
-              <h2 className="text-xl font-medium mb-2">LLM ReAct Agent</h2>
-              <p className="text-sm">支持自主推理、工具调用、知识库问答的智能助手</p>
-              <p className="text-xs mt-2">输入消息开始对话</p>
+          <div className="h-full flex items-center justify-center px-6">
+            <div className="max-w-2xl w-full text-center">
+              <p className="text-sm text-gray-400/80 dark:text-gray-500/80">输入消息开始对话，支持 Mermaid 图表、工具调用与知识库问答</p>
             </div>
           </div>
         ) : (
@@ -130,7 +127,7 @@ export default function ChatView() {
             atBottomThreshold={150}
             isScrolling={handleIsScrolling}
             itemContent={(_, msg) => (
-              <div className="max-w-4xl mx-auto px-4">
+              <div className="max-w-6xl mx-auto px-4">
                 <MessageBubble message={msg} />
               </div>
             )}
@@ -138,7 +135,7 @@ export default function ChatView() {
               // 流式进行中：在底部实时展示思考过程（默认展开）
               Footer: () =>
                 isStreaming && thinkingNodes.length > 0 ? (
-                  <div className="max-w-4xl mx-auto px-4 pb-4">
+                  <div className="max-w-6xl mx-auto px-4 pb-2">
                     <div className="flex justify-start mb-4">
                       <div className="max-w-[80%]">
                         <ThinkingPanel nodes={thinkingNodes} isStreaming defaultExpanded />
