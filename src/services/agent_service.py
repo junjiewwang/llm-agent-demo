@@ -409,13 +409,19 @@ class AgentService:
         else:
             result = ChatResult(content=result_holder[0] or "", usage=usage)
 
-        # 将 Agent 回答写入 chat_history 并持久化
+        # 将 Agent 回答写入 chat_history 并持久化（含 usage）
+        def _make_entry(content: str) -> dict:
+            entry: dict = {"role": "assistant", "content": content}
+            if result.usage:
+                entry["usage"] = result.usage
+            return entry
+
         if result.content:
-            conv.chat_history.append({"role": "assistant", "content": result.content})
+            conv.chat_history.append(_make_entry(result.content))
         elif result.stopped:
-            conv.chat_history.append({"role": "assistant", "content": "[对话已停止]"})
+            conv.chat_history.append(_make_entry("[对话已停止]"))
         elif result.error:
-            conv.chat_history.append({"role": "assistant", "content": f"[错误] {result.error}"})
+            conv.chat_history.append(_make_entry(f"[错误] {result.error}"))
 
         conv.chat_history = conv.chat_history
         self._save_tenant(tenant_id)

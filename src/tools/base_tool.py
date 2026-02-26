@@ -24,6 +24,17 @@ class BaseTool(ABC):
         - execute: 实际执行逻辑
     """
 
+    _STRUCTURED_TOOL_CONTRACT: str = (
+        "\n\n[结构化调用约束] "
+        "本工具是结构化参数 API，不是 shell 终端。"
+        "参数中不得使用 shell 语法（| > < ; &）。"
+        "如需筛选或处理，请使用工具原生参数，或先获取结果再分析。"
+    )
+    """统一注入到所有工具 description 的结构化调用契约。"""
+
+    _enable_structured_contract: bool = True
+    """是否启用结构化调用契约。子类可覆写为 False 以关闭。"""
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -64,13 +75,19 @@ class BaseTool(ABC):
         """
         return False
 
+    def _build_description(self) -> str:
+        """组合子类 description + 统一结构化工具调用契约。"""
+        if self._enable_structured_contract:
+            return self.description + self._STRUCTURED_TOOL_CONTRACT
+        return self.description
+
     def to_openai_tool(self) -> Dict[str, Any]:
         """转换为 OpenAI Function Calling 的 tool 格式。"""
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": self._build_description(),
                 "parameters": self.parameters,
             },
         }
