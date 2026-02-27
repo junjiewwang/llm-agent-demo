@@ -12,6 +12,45 @@ class LLMSettings(BaseSettings):
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4o"
+    context_window: int = 0  # 0 = 自动根据模型名推导
+
+    # 内置模型容量映射表（可扩展）
+    # 注意：这里配置的是 Input Context Window，不含 Output
+    MODEL_CONTEXT_WINDOWS: dict = {
+        # OpenAI
+        "gpt-4o": 128_000,
+        "gpt-4-turbo": 128_000,
+        "gpt-4": 8_192,
+        "gpt-3.5-turbo": 16_385,
+        "gpt-3.5-turbo-16k": 16_385,
+        # Anthropic
+        "claude-3-opus-20240229": 200_000,
+        "claude-3-sonnet-20240229": 200_000,
+        "claude-3-haiku-20240307": 200_000,
+        # DeepSeek
+        "deepseek-chat": 64_000,
+        "deepseek-coder": 64_000,
+        # Local / Others
+        "llama3-70b-8192": 8_192,
+        "mixtral-8x7b-32768": 32_768,
+    }
+
+    def model_post_init(self, __context):
+        """初始化后自动推导 context_window。"""
+        super().model_post_init(__context)
+        if self.context_window == 0:
+            # 1. 精确匹配
+            if self.model in self.MODEL_CONTEXT_WINDOWS:
+                self.context_window = self.MODEL_CONTEXT_WINDOWS[self.model]
+            # 2. 模糊匹配（如 gpt-4o-2024-05-13 -> gpt-4o）
+            else:
+                for key, val in self.MODEL_CONTEXT_WINDOWS.items():
+                    if key in self.model:
+                        self.context_window = val
+                        break
+                else:
+                    # 3. 默认兜底（保守值）
+                    self.context_window = 8_192
 
     model_config = SettingsConfigDict(
         env_prefix="LLM_",
@@ -41,6 +80,13 @@ class AgentSettings(BaseSettings):
     message_usage_enabled: bool = True  # 前端展示消息级 token 消耗
     policy_enabled: bool = False  # 工具策略重排（Sprint 2）
     memory_governor_enabled: bool = False  # 长期记忆治理（Sprint 3）
+    env_adapter_enabled: bool = False  # 环境适配器（Sprint 3）
+
+    # ── Memory Governor 配置 ──
+    memory_governor_interval: int = 300  # 治理周期（秒），默认 5 分钟
+    memory_default_ttl_days: float = 30  # 新记忆默认 TTL（天），0 = 永不过期
+    memory_min_value_score: float = 0.1  # 低于此分值的记忆将被驱逐
+    memory_merge_threshold: float = 0.15  # cosine distance 低于此值触发归并
 
     model_config = SettingsConfigDict(
         env_prefix="AGENT_",

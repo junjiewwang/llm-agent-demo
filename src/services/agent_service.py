@@ -110,9 +110,14 @@ class AgentService:
     # ── 租户管理 ──
 
     def _get_or_create_tenant(self, tenant_id: str) -> TenantSession:
-        """获取或创建租户会话（内存缓存层）。"""
+        """获取或创建租户会话（内存缓存层）。
+
+        查找顺序：内存缓存 → 磁盘恢复 → 创建新租户。
+        确保不会因为内存缓存未命中而创建空 tenant 覆盖磁盘数据。
+        """
         if tenant_id not in self._tenants:
-            self._tenants[tenant_id] = create_tenant_session(tenant_id)
+            if not self._try_restore_tenant(tenant_id):
+                self._tenants[tenant_id] = create_tenant_session(tenant_id)
         return self._tenants[tenant_id]
 
     def _save_tenant(self, tenant_id: str) -> None:
@@ -123,13 +128,14 @@ class AgentService:
 
         conversations = {}
         for conv_id, conv in tenant.conversations.items():
+            serialized = conv.memory.serialize()
             conversations[conv_id] = {
                 "id": conv.id,
                 "title": conv.title,
                 "created_at": conv.created_at,
                 "chat_history": conv.chat_history,
-                "memory_messages": conv.memory.serialize()["messages"],
-                "system_prompt_count": conv.memory.serialize()["system_prompt_count"],
+                "memory_messages": serialized["messages"],
+                "system_prompt_count": serialized["system_prompt_count"],
             }
 
         self._session_store.save_tenant(
@@ -149,7 +155,10 @@ class AgentService:
             return False
 
         try:
-            tenant = self._get_or_create_tenant(tenant_id)
+            # 直接创建空 tenant，避免通过 _get_or_create_tenant 产生递归
+            if tenant_id not in self._tenants:
+                self._tenants[tenant_id] = create_tenant_session(tenant_id)
+            tenant = self._tenants[tenant_id]
             conv_data_map = data.get("conversations", {})
 
             for conv_id, conv_data in conv_data_map.items():
@@ -539,6 +548,52 @@ class AgentService:
             kb.clear()
             return True
         return False
+
+    # ── 技能管理 ──
+
+    def list_skills(self) -> List[dict]:
+        """获取所有已注册 Skill 的信息列表。
+
+        Returns:
+            [{name, display_name, description, priority, enabled,
+              required_tools, tools_satisfied, trigger_patterns,
+              has_resources, resource_count}, ...]
+        """
+        if not self._shared or not self._shared.skill_router:
+            return []
+
+        registry = self._shared.skill_router.registry
+        tool_names = self._shared.tool_registry.tool_names
+
+        result = []
+        for skill in registry.list_all():
+            result.append({
+                "name": skill.name,
+                "display_name": skill.display_name,
+                "description": skill.description,
+                "priority": skill.priority,
+                "enabled": registry.is_enabled(skill.name),
+                "required_tools": list(skill.required_tools),
+                "tools_satisfied": registry.check_tools_satisfied(skill, tool_names),
+                "trigger_patterns": list(skill.trigger_patterns),
+                "has_resources": skill.has_resources,
+                "resource_count": len(skill.references) + len(skill.scripts),
+            })
+        return result
+
+    def toggle_skill(self, name: str, enabled: bool) -> bool:
+        """启用或禁用指定 Skill。
+
+        Args:
+            name: Skill 名称。
+            enabled: True=启用，False=禁用。
+
+        Returns:
+            True 表示操作成功，False 表示 Skill 不存在。
+        """
+        if not self._shared or not self._shared.skill_router:
+            return False
+        return self._shared.skill_router.registry.set_enabled(name, enabled)
 
     # ── 状态 ──
 

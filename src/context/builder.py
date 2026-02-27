@@ -32,6 +32,7 @@ from src.utils.logger import logger
 
 if TYPE_CHECKING:
     from src.skills.base import Skill
+    from src.tools.base_tool import ToolRegistry
 
 # 环境变量提供者类型：返回 key→value 的字典
 EnvironmentProvider = Callable[[], Dict[str, str]]
@@ -43,6 +44,23 @@ def default_environment() -> Dict[str, str]:
     return {
         "当前时间": now.strftime("%Y-%m-%d %H:%M:%S (%A)"),
     }
+
+
+def tool_environment(registry: "ToolRegistry") -> EnvironmentProvider:
+    """创建工具列表环境提供者。
+
+    将已注册工具的摘要信息注入 Environment Zone，
+    使 Skill 可以直接引用可用工具列表，无需运行时扫描目录。
+
+    Args:
+        registry: 工具注册中心实例。
+
+    Returns:
+        EnvironmentProvider 闭包。
+    """
+    def provider() -> Dict[str, str]:
+        return {"可用工具": registry.get_tools_summary()}
+    return provider
 
 
 class ContextBuilder:
@@ -84,6 +102,9 @@ class ContextBuilder:
     def set_skills(self, skills: List["Skill"]) -> "ContextBuilder":
         """设置当前激活的 Skills（按需注入领域专家 prompt）。
 
+        对于包含附属资源的 Skill，会在 system_prompt 后追加资源导航提示，
+        引导 Agent 通过 fs_read 按需加载 Level 3 资源。
+
         Args:
             skills: 匹配到的 Skill 列表（通常 0~2 个）。
         """
@@ -91,16 +112,56 @@ class ContextBuilder:
             self._skill_messages = []
             return self
 
-        skill_prompts = "\n\n".join(s.system_prompt for s in skills)
+        parts = []
+        for s in skills:
+            prompt = s.system_prompt
+            # 追加资源导航提示（Level 3 渐进式披露）
+            resource_hint = self._build_resource_hint(s)
+            if resource_hint:
+                prompt = f"{prompt}\n\n{resource_hint}"
+            parts.append(prompt)
+
         self._skill_messages = [
             Message(
                 role=Role.SYSTEM,
-                content=skill_prompts,
+                content="\n\n".join(parts),
             )
         ]
         skill_names = [s.name for s in skills]
         logger.debug("ContextBuilder: 设置 {} 个 Skill: {}", len(skills), skill_names)
         return self
+
+    @staticmethod
+    def _build_resource_hint(skill: "Skill") -> str:
+        """为包含附属资源的 Skill 构建资源导航提示。
+
+        仅列出文件路径索引，Agent 可通过 fs_read 按需加载具体内容，
+        实现 Level 3 渐进式披露，避免一次性注入过多 token。
+
+        Args:
+            skill: Skill 实例。
+
+        Returns:
+            资源导航提示字符串；无资源时返回空字符串。
+        """
+        if not skill.has_resources:
+            return ""
+
+        lines = ["---", "📂 可用资源（按需使用 fs_read 读取）:"]
+
+        if skill.references:
+            lines.append("  参考资料:")
+            for ref in skill.references:
+                full_path = f"{skill.base_dir}/{ref}" if skill.base_dir else ref
+                lines.append(f"    - {full_path}")
+
+        if skill.scripts:
+            lines.append("  脚本:")
+            for script in skill.scripts:
+                full_path = f"{skill.base_dir}/{script}" if skill.base_dir else script
+                lines.append(f"    - {full_path}")
+
+        return "\n".join(lines)
 
     def set_knowledge(self, results: List[dict]) -> "ContextBuilder":
         """设置知识库检索结果（临时注入，不持久化）。
@@ -186,10 +247,23 @@ class ContextBuilder:
         if not env_items:
             return None
 
-        env_text = " | ".join(f"{k}: {v}" for k, v in env_items.items())
+        # 单行值用 " | " 紧凑拼接，多行值（如工具列表）独立成段
+        inline_parts = []
+        block_parts = []
+        for k, v in env_items.items():
+            if "\n" in v:
+                block_parts.append(v)
+            else:
+                inline_parts.append(f"{k}: {v}")
+
+        sections = []
+        if inline_parts:
+            sections.append(" | ".join(inline_parts))
+        sections.extend(block_parts)
+
         return Message(
             role=Role.SYSTEM,
-            content=env_text,
+            content="\n\n".join(sections),
         )
 
     def build(self, conversation_messages: List[Message]) -> List[Message]:

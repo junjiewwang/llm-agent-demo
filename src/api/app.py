@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from src.api.dependencies import get_service
-from src.api.routers import chat, session, knowledge, status, auth
+from src.api.routers import chat, session, knowledge, status, auth, skills
 from src.observability import init_telemetry, shutdown_telemetry
 from src.utils.logger import logger
 
@@ -66,6 +66,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api", tags=["聊天"])
     app.include_router(knowledge.router, prefix="/api", tags=["知识库"])
     app.include_router(status.router, prefix="/api", tags=["系统状态"])
+    app.include_router(skills.router, prefix="/api", tags=["技能管理"])
 
     # 生产模式：托管 React 构建产物
     frontend_dist = os.path.join(os.path.dirname(__file__), "../../frontend/dist")

@@ -45,6 +45,10 @@ SKILL_FILENAME = "SKILL.md"
 # Front Matter 必填字段
 _REQUIRED_FIELDS = {"name", "display_name", "description"}
 
+# 可自动扫描的附属资源子目录名
+_REFERENCES_DIR = "references"
+_SCRIPTS_DIR = "scripts"
+
 
 def _parse_skill_md(content: str) -> Tuple[dict, str]:
     """解析 SKILL.md 文件内容，分离 YAML Front Matter 和 Markdown 正文。
@@ -82,6 +86,30 @@ def _parse_skill_md(content: str) -> Tuple[dict, str]:
         raise ValueError("Front Matter 必须是 YAML 字典格式")
 
     return front_matter, markdown_body
+
+
+def _scan_resource_dir(base_dir: Path, subdir_name: str) -> Tuple[str, ...]:
+    """扫描 Skill 目录下的附属资源子目录，返回相对路径元组。
+
+    只收集文件（忽略隐藏文件和 __pycache__），按文件名排序确保稳定性。
+
+    Args:
+        base_dir: Skill 所在目录。
+        subdir_name: 子目录名（如 'references' 或 'scripts'）。
+
+    Returns:
+        相对于 base_dir 的文件路径元组（如 ('references/common-errors.md',)）。
+    """
+    subdir = base_dir / subdir_name
+    if not subdir.is_dir():
+        return ()
+
+    paths = sorted(
+        f for f in subdir.rglob("*")
+        if f.is_file() and not f.name.startswith(".")
+        and "__pycache__" not in f.parts
+    )
+    return tuple(str(p.relative_to(base_dir)) for p in paths)
 
 
 def load_from_file(path: Path) -> Skill:
@@ -133,7 +161,21 @@ def load_from_file(path: Path) -> Skill:
     if "max_coexist" in front_matter:
         skill_fields["max_coexist"] = int(front_matter["max_coexist"])
 
-    return Skill(**skill_fields)
+    # 附属资源扫描（Level 3 渐进式披露）
+    base_dir = path.parent
+    skill_fields["base_dir"] = str(base_dir)
+    skill_fields["references"] = _scan_resource_dir(base_dir, _REFERENCES_DIR)
+    skill_fields["scripts"] = _scan_resource_dir(base_dir, _SCRIPTS_DIR)
+
+    skill = Skill(**skill_fields)
+
+    if skill.has_resources:
+        logger.info(
+            "Skill '{}' 加载了附属资源: {} references, {} scripts",
+            skill.name, len(skill.references), len(skill.scripts),
+        )
+
+    return skill
 
 
 def load_from_directory(

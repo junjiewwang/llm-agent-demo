@@ -53,7 +53,7 @@ export default function MessageBubble({ message }: Props) {
   const hasMermaid = !isUser && /```mermaid\b/.test(message.content)
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
+    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4 animate-[msgFadeIn_0.3s_ease-out]`}>
       {/* 外层：assistant 固定宽度防缩放抖动；user 保持内容驱动 */}
       <div className={
         isUser
@@ -71,9 +71,10 @@ export default function MessageBubble({ message }: Props) {
         <div
           className={`rounded-2xl px-4 py-3 ${
             isUser
-              ? 'bg-blue-600 text-white rounded-br-md'
+              ? 'text-white rounded-br-md'
               : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 shadow-sm border border-gray-100 dark:border-gray-700 rounded-bl-md'
           }`}
+          style={isUser ? { backgroundColor: 'var(--brand-primary)' } : undefined}
         >
           {isUser ? (
             <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</p>

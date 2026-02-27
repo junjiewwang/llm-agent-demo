@@ -11,6 +11,7 @@ import type {
   UploadData,
   TokenResponse,
   UserInfo,
+  SkillInfo,
 } from '../types/index'
 
 import { useSessionStore } from '../stores/sessionStore'
@@ -153,4 +154,20 @@ export async function uploadFiles(files: File[]): Promise<ApiResponse<UploadData
 /** 清空知识库 */
 export async function clearKnowledgeBase(): Promise<ApiResponse<{ message: string }>> {
   return request('/knowledge', { method: 'DELETE' })
+}
+
+/** 获取 Skill 列表 */
+export async function listSkills(): Promise<ApiResponse<SkillInfo[]>> {
+  return request('/skills')
+}
+
+/** 启用/禁用 Skill */
+export async function toggleSkill(
+  name: string,
+  enabled: boolean,
+): Promise<ApiResponse<{ name: string; enabled: boolean }>> {
+  return request(`/skills/${encodeURIComponent(name)}/toggle`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  })
 }

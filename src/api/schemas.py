@@ -134,3 +134,26 @@ class UserInfo(BaseModel):
     username: str
     created_at: float
 
+
+# ── 技能管理 ──
+
+class SkillInfo(BaseModel):
+    """Skill 信息（用于列表展示）。"""
+
+    name: str = Field(..., description="唯一标识名称")
+    display_name: str = Field(..., description="展示名称")
+    description: str = Field("", description="简短描述")
+    priority: int = Field(100, description="优先级（值越小越优先）")
+    enabled: bool = Field(True, description="是否启用")
+    required_tools: List[str] = Field(default_factory=list, description="依赖的工具列表")
+    tools_satisfied: bool = Field(True, description="依赖工具是否全部满足")
+    trigger_patterns: List[str] = Field(default_factory=list, description="触发关键词")
+    has_resources: bool = Field(False, description="是否包含附属资源")
+    resource_count: int = Field(0, description="附属资源数量")
+
+
+class ToggleSkillRequest(BaseModel):
+    """Skill 启停请求。"""
+
+    enabled: bool = Field(..., description="True=启用，False=禁用")
+

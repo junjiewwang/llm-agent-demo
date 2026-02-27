@@ -135,14 +135,14 @@ export default function ChatView() {
               // 流式进行中：在底部实时展示思考过程（默认展开）
               Footer: () =>
                 isStreaming && thinkingNodes.length > 0 ? (
-                  <div className="max-w-6xl mx-auto px-4 pb-2">
+                  <div className="max-w-6xl mx-auto px-4 pb-4">
                     <div className="flex justify-start mb-4">
                       <div className="max-w-[80%]">
                         <ThinkingPanel nodes={thinkingNodes} isStreaming defaultExpanded />
                       </div>
                     </div>
                   </div>
-                ) : null,
+                ) : <div className="h-4" />,
             }}
           />
         )}

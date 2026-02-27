@@ -23,9 +23,9 @@ export default function Header() {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 12h16M4 18h16" />
           </svg>
         </button>
-        <h1 className="text-base font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
+        <h1 className="text-base font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2" style={{ fontFamily: 'var(--font-heading)' }}>
           <span className="text-xl">🤖</span>
-          LLM ReAct Agent
+          <span className="tracking-tight">LLM ReAct Agent</span>
         </h1>
       </div>
 
@@ -52,7 +52,10 @@ export default function Header() {
           ) : (
             <button
               onClick={() => setIsLoginOpen(true)}
-              className="text-sm px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium shadow-sm"
+              className="text-sm px-3 py-1.5 text-white rounded-lg transition-colors font-medium shadow-sm"
+              style={{ backgroundColor: 'var(--brand-primary)' }}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--brand-primary-hover)'}
+              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'var(--brand-primary)'}
             >
               登录 / 注册
             </button>

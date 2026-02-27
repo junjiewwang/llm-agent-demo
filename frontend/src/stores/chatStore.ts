@@ -7,7 +7,7 @@ import { create } from 'zustand'
 import type { ChatMessage, ThinkingNode, StatusInfo, ToolConfirmEvent } from '../types'
 import { chatSSE } from '../api/sse'
 import { stopChat as apiStopChat, confirmTool as apiConfirmTool } from '../api/client'
-import { useConversationStore } from './conversationStore'
+import { syncDoneEvent } from './actions'
 
 interface ChatState {
   messages: ChatMessage[]
@@ -81,13 +81,8 @@ export const useChatStore = create<ChatState>((set) => ({
             }
           }
         }
-        set({
-          messages: history,
-          isStreaming: false,
-          status: data.status,
-          pendingConfirm: null,
-        })
-        useConversationStore.getState().setConversations(data.conversations)
+        set({ isStreaming: false, pendingConfirm: null })
+        syncDoneEvent(history, data.conversations, data.status)
         abortController = null
       },
 

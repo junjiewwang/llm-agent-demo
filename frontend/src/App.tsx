@@ -8,6 +8,8 @@ import { useSessionStore } from './stores/sessionStore'
 import { useChatStore } from './stores/chatStore'
 import { useConversationStore } from './stores/conversationStore'
 import { restoreSession } from './api/client'
+import ErrorBoundary from './components/ErrorBoundary'
+import ToastContainer from './components/Toast'
 import Header from './components/layout/Header'
 import Sidebar from './components/layout/Sidebar'
 import StatusPanel from './components/layout/StatusPanel'
@@ -78,15 +80,18 @@ export default function App() {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
-      <Header />
-      <div className="flex flex-1 overflow-hidden">
-        <Sidebar />
-        <main className="flex-1 flex flex-col overflow-hidden bg-white dark:bg-gray-950">
-          <ChatView />
-        </main>
-        <StatusPanel />
+    <ErrorBoundary>
+      <div className="h-screen flex flex-col bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
+        <Header />
+        <div className="flex flex-1 overflow-hidden">
+          <Sidebar />
+          <main className="flex-1 flex flex-col overflow-hidden bg-white dark:bg-gray-950">
+            <ChatView />
+          </main>
+          <StatusPanel />
+        </div>
       </div>
-    </div>
+      <ToastContainer />
+    </ErrorBoundary>
   )
 }

@@ -4,6 +4,7 @@
 import { useChatStore } from '../../stores/chatStore'
 import { useUIStore } from '../../stores/uiStore'
 import KnowledgePanel from './KnowledgePanel'
+import SkillsPanel from './SkillsPanel'
 
 export default function StatusPanel() {
   const status = useChatStore((s) => s.status)
@@ -35,6 +36,7 @@ export default function StatusPanel() {
       </div>
 
       <KnowledgePanel />
+      <SkillsPanel />
     </aside>
   )
 }

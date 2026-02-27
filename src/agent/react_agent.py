@@ -21,7 +21,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from src.agent.base_agent import BaseAgent, OnEventCallback, WaitForConfirmation
 from src.agent.events import AgentEvent, AgentStoppedError, EventType
@@ -29,6 +29,7 @@ from src.agent.loop_detector import LoopDetector
 from src.agent.metrics import RunMetrics
 from src.config import settings
 from src.context.builder import ContextBuilder
+from src.environment.adapter_base import EnvironmentAdapter
 from src.llm.base_client import BaseLLMClient, Message, Role
 from src.memory.conversation import ConversationMemory
 from src.memory.vector_store import VectorStore
@@ -70,6 +71,7 @@ class ReActAgent(BaseAgent):
         vector_store: Optional[VectorStore] = None,
         knowledge_base: Optional["KnowledgeBase"] = None,
         skill_router: Optional["SkillRouter"] = None,
+        env_adapter: Optional[EnvironmentAdapter] = None,
         max_iterations: Optional[int] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -79,6 +81,7 @@ class ReActAgent(BaseAgent):
         self._vector_store = vector_store
         self._knowledge_base = knowledge_base
         self._skill_router = skill_router
+        self._env_adapter = env_adapter
         self._max_iterations = max_iterations or settings.agent.max_iterations
         self._temperature = temperature or settings.agent.temperature
         self._max_tokens = max_tokens or settings.agent.max_tokens
@@ -282,6 +285,8 @@ class ReActAgent(BaseAgent):
         仅当检索结果与 query 的 cosine distance 低于阈值时才注入，
         避免不相关的记忆浪费 token。
         检索 distance 分数记录到当前 Span，便于可观测和阈值调优。
+
+        命中的记忆会异步更新 hit_count 和 last_hit（供 Governor 评估价值）。
         """
         if not self._vector_store or self._vector_store.count() == 0:
             self._context_builder.set_memory([])
@@ -306,6 +311,39 @@ class ReActAgent(BaseAgent):
             if relevant:
                 metrics.memory_items_injected = len(relevant)
                 logger.info("注入 {} 条长期记忆（threshold={}）", len(relevant), threshold)
+
+                # 异步 hit writeback：更新命中记忆的 hit_count 和 last_hit
+                if settings.agent.memory_governor_enabled:
+                    self._writeback_memory_hits(relevant)
+
+    def _writeback_memory_hits(self, relevant_memories: List[Dict[str, Any]]) -> None:
+        """异步更新命中记忆的 hit_count 和 last_hit。
+
+        使用后台线程执行，不阻塞主请求链路。
+        """
+        if not self._vector_store:
+            return
+
+        import threading
+        store = self._vector_store
+
+        def _do_writeback():
+            now = time.time()
+            for mem in relevant_memories:
+                mem_id = mem.get("id")
+                if not mem_id:
+                    continue
+                meta = mem.get("metadata", {})
+                store.update_metadata(mem_id, {
+                    "hit_count": meta.get("hit_count", 0) + 1,
+                    "last_hit": now,
+                })
+
+        threading.Thread(
+            target=_do_writeback,
+            name="memory-hit-writeback",
+            daemon=True,
+        ).start()
 
     def _inject_skills(self, user_input: str) -> None:
         """根据用户意图匹配 Skills，通过 ContextBuilder 临时注入领域专家 prompt。

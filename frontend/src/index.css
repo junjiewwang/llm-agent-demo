@@ -1,5 +1,66 @@
 @import 'tailwindcss';
 
+/* ── 品牌色系统 ── */
+:root {
+  /* 主色：深邃靛蓝 */
+  --brand-primary: #4f46e5;
+  --brand-primary-hover: #4338ca;
+  --brand-primary-light: #eef2ff;
+  --brand-primary-muted: rgba(79, 70, 229, 0.12);
+
+  /* 强调色：活力蓝紫 */
+  --brand-accent: #7c3aed;
+  --brand-accent-hover: #6d28d9;
+
+  /* 表面色 */
+  --brand-surface: #ffffff;
+  --brand-surface-secondary: #f8fafc;
+  --brand-surface-elevated: #ffffff;
+
+  /* 文字色 */
+  --brand-text: #1e293b;
+  --brand-text-secondary: #64748b;
+  --brand-text-muted: #94a3b8;
+
+  /* 边框色 */
+  --brand-border: #e2e8f0;
+  --brand-border-light: #f1f5f9;
+
+  /* 字体 */
+  --font-heading: 'Inter', 'Noto Sans SC', system-ui, sans-serif;
+  --font-body: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* 暗色模式品牌色覆盖 */
+.dark {
+  --brand-primary: #818cf8;
+  --brand-primary-hover: #6366f1;
+  --brand-primary-light: rgba(99, 102, 241, 0.15);
+  --brand-primary-muted: rgba(129, 140, 248, 0.12);
+
+  --brand-accent: #a78bfa;
+  --brand-accent-hover: #8b5cf6;
+
+  --brand-surface: #0f172a;
+  --brand-surface-secondary: #1e293b;
+  --brand-surface-elevated: #1e293b;
+
+  --brand-text: #f1f5f9;
+  --brand-text-secondary: #94a3b8;
+  --brand-text-muted: #64748b;
+
+  --brand-border: #334155;
+  --brand-border-light: #1e293b;
+}
+
+/* 全局字体 */
+body {
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 /* 自定义滚动条 — 细窄、半透明、圆角 */
 * {
   scrollbar-width: thin;
@@ -36,5 +97,29 @@
 
   *::-webkit-scrollbar-thumb:hover {
     background: rgba(200, 200, 200, 0.35);
+  }
+}
+
+/* Toast 入场动画 */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* 消息气泡入场动画 */
+@keyframes msgFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }

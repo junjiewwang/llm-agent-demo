@@ -15,7 +15,7 @@ Skill 不包含执行逻辑，而是通过声明式的 prompt 片段注入 LLM �
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,9 @@ class Skill:
         required_tools: 该 Skill 依赖的工具名列表（用于校验和提示）。
         priority: 优先级（值越小越优先），同时匹配多个 Skill 时取优先级最高的。
         max_coexist: 最大共存数量，限制同时激活的 Skill 数避免 token 浪费。
+        base_dir: Skill 所在目录的绝对路径（由 loader 自动填充）。
+        references: 附属参考资料文件路径列表（相对于 base_dir）。
+        scripts: 附属脚本文件路径列表（相对于 base_dir）。
     """
 
     name: str
@@ -41,12 +44,20 @@ class Skill:
     required_tools: List[str] = field(default_factory=list)
     priority: int = 100
     max_coexist: int = 2
+    base_dir: Optional[str] = None
+    references: Tuple[str, ...] = ()
+    scripts: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("Skill name 不能为空")
         if not self.system_prompt:
             raise ValueError(f"Skill '{self.name}' 的 system_prompt 不能为空")
+
+    @property
+    def has_resources(self) -> bool:
+        """是否包含附属资源（references 或 scripts）。"""
+        return bool(self.references or self.scripts)
 
     @property
     def prompt_token_hint(self) -> int:

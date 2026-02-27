@@ -40,7 +40,10 @@ export default function Sidebar() {
         <button
           onClick={handleNew}
           disabled={isStreaming}
-          className="w-full flex items-center justify-center gap-2 h-10 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white text-sm font-medium transition-colors"
+          className="w-full flex items-center justify-center gap-2 h-10 rounded-xl text-white text-sm font-medium transition-colors disabled:bg-gray-400"
+          style={{ backgroundColor: isStreaming ? undefined : 'var(--brand-primary)' }}
+          onMouseEnter={(e) => { if (!isStreaming) e.currentTarget.style.backgroundColor = 'var(--brand-primary-hover)' }}
+          onMouseLeave={(e) => { if (!isStreaming) e.currentTarget.style.backgroundColor = 'var(--brand-primary)' }}
           title="新建对话"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -66,9 +69,10 @@ export default function Sidebar() {
               title={conv.title}
               className={`group flex items-center ${sidebarCollapsed ? 'justify-center px-2' : 'gap-2 px-3'} py-2.5 rounded-lg cursor-pointer text-sm transition-colors ${
                 conv.id === activeId
-                  ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 font-medium'
+                  ? 'text-indigo-700 dark:text-indigo-300 font-medium'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
               }`}
+              style={conv.id === activeId ? { backgroundColor: 'var(--brand-primary-light)' } : undefined}
             >
               <svg className="w-4 h-4 flex-shrink-0 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path

@@ -10,7 +10,7 @@ import {
   activateConversation as apiActivate,
   deleteConversation as apiDelete,
 } from '../api/client'
-import { useChatStore } from './chatStore'
+import { syncConversationData, syncNewConversation } from './actions'
 
 interface ConversationState {
   conversations: ConversationInfo[]
@@ -34,41 +34,21 @@ export const useConversationStore = create<ConversationState>((set) => ({
   createConversation: async (tenantId) => {
     const res = await apiCreate(tenantId)
     if (res.success && res.data) {
-      const active = res.data.conversations.find((c) => c.active)
-      set({
-        conversations: res.data.conversations,
-        activeId: active?.id ?? null,
-      })
-      useChatStore.getState().setMessages([])
-      useChatStore.getState().setStatus(res.data.status)
+      syncNewConversation(res.data.conversations, res.data.status)
     }
   },
 
   switchConversation: async (tenantId, convId) => {
     const res = await apiActivate(tenantId, convId)
     if (res.success && res.data) {
-      const active = res.data.conversations.find((c) => c.active)
-      set({
-        conversations: res.data.conversations,
-        activeId: active?.id ?? null,
-      })
-      useChatStore.getState().setMessages(res.data.chat_history)
-      useChatStore.getState().setStatus(res.data.status)
-      useChatStore.getState().clearThinking()
+      syncConversationData(res.data.chat_history, res.data.conversations, res.data.status)
     }
   },
 
   deleteConversation: async (tenantId, convId) => {
     const res = await apiDelete(tenantId, convId)
     if (res.success && res.data) {
-      const active = res.data.conversations.find((c) => c.active)
-      set({
-        conversations: res.data.conversations,
-        activeId: active?.id ?? null,
-      })
-      useChatStore.getState().setMessages(res.data.chat_history)
-      useChatStore.getState().setStatus(res.data.status)
-      useChatStore.getState().clearThinking()
+      syncConversationData(res.data.chat_history, res.data.conversations, res.data.status)
     }
   },
 }))

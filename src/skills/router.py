@@ -36,11 +36,16 @@ class SkillRouter:
         self._registry = registry
         self._max_active_skills = max_active_skills
 
+    @property
+    def registry(self) -> SkillRegistry:
+        """暴露内部 SkillRegistry，供 API 层查询和管理。"""
+        return self._registry
+
     def match(self, user_input: str) -> List[SkillMatchResult]:
         """根据用户输入匹配合适的 Skill。
 
         匹配流程：
-        1. 对所有 Skill 进行关键词匹配
+        1. 对所有已启用的 Skill 进行关键词匹配
         2. 按 (score desc, priority asc) 排序
         3. 截取 top-N（受 max_active_skills 限制）
 
@@ -56,7 +61,7 @@ class SkillRouter:
         candidates: List[SkillMatchResult] = []
         input_lower = user_input.lower()
 
-        for skill in self._registry.list_all():
+        for skill in self._registry.list_active():
             result = self._keyword_match(skill, input_lower)
             if result is not None:
                 candidates.append(result)

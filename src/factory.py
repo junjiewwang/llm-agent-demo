@@ -15,8 +15,10 @@ from typing import Optional, Dict, List
 
 from src.agent import ReActAgent
 from src.context import ContextBuilder
+from src.context.builder import default_environment, tool_environment
+from src.environment.tool_env_adapter import ToolEnvAdapter
 from src.llm import OpenAIClient
-from src.memory import ConversationMemory, VectorStore
+from src.memory import ConversationMemory, MemoryGovernor, VectorStore
 from src.rag import KnowledgeBase
 from src.skills import SkillRegistry, SkillRouter, load_from_directory
 from src.tools import (
@@ -97,6 +99,7 @@ class TenantSession:
 
     tenant_id: str
     vector_store: Optional[VectorStore]
+    governor: Optional[MemoryGovernor] = None
     conversations: Dict[str, Conversation] = field(default_factory=dict)
     active_conv_id: Optional[str] = None
 
@@ -159,6 +162,10 @@ def create_tool_registry(knowledge_base: Optional[KnowledgeBase]) -> ToolRegistr
     )
     registry.register(FileReaderTool(sandbox))
     registry.register(FileWriterTool(sandbox))
+
+    # 标准化别名：使 Skill 可以用通用名称引用工具
+    registry.register_alias("fs_read", "file_reader")
+    registry.register_alias("fs_write", "file_writer")
 
     # DevOps 工具：按配置按需注册
     _register_devops_tools(registry)
@@ -298,6 +305,27 @@ def create_skill_router(tool_registry: ToolRegistry) -> SkillRouter:
     return SkillRouter(registry)
 
 
+def _log_feature_flags() -> None:
+    """输出 Agent Feature Flags 状态摘要，便于启动时确认功能开关。"""
+    cfg = settings.agent
+
+    def _flag(val: bool) -> str:
+        return "ON" if val else "OFF"
+
+    lines = [
+        "Feature Flags 状态:",
+        f"  message_usage    = {_flag(cfg.message_usage_enabled)}",
+        f"  policy           = {_flag(cfg.policy_enabled)}",
+        f"  memory_governor  = {_flag(cfg.memory_governor_enabled)}"
+        f"  (interval={cfg.memory_governor_interval}s,"
+        f" ttl={cfg.memory_default_ttl_days}d,"
+        f" min_score={cfg.memory_min_value_score},"
+        f" merge_threshold={cfg.memory_merge_threshold})",
+        f"  env_adapter      = {_flag(cfg.env_adapter_enabled)}",
+    ]
+    logger.info("\n".join(lines))
+
+
 def create_shared_components() -> SharedComponents:
     """创建全局共享组件。
 
@@ -315,6 +343,8 @@ def create_shared_components() -> SharedComponents:
     tool_registry = create_tool_registry(knowledge_base)
     skill_router = create_skill_router(tool_registry)
 
+    _log_feature_flags()
+
     return SharedComponents(
         llm_client=llm_client,
         tool_registry=tool_registry,
@@ -324,19 +354,32 @@ def create_shared_components() -> SharedComponents:
 
 
 def create_tenant_session(tenant_id: str) -> TenantSession:
-    """为租户创建会话（包含独立的长期记忆）。"""
+    """为租户创建会话（包含独立的长期记忆和可选的 Governor）。"""
     # ChromaDB collection name 要求 3-63 字符，[a-zA-Z0-9._-]，不能以 _ 结尾
     safe_id = tenant_id[:16] if tenant_id else uuid.uuid4().hex[:16]
     vector_store: Optional[VectorStore] = None
+    governor: Optional[MemoryGovernor] = None
+
     try:
         vector_store = VectorStore(
             collection_name=f"mem-{safe_id}",
             persist_directory=f".agent_data/memory/{safe_id}",
+            default_ttl_days=settings.agent.memory_default_ttl_days,
         )
     except Exception as e:
         logger.warning("租户 {} 长期记忆初始化失败: {}", safe_id[:8], e)
 
-    return TenantSession(tenant_id=tenant_id, vector_store=vector_store)
+    # Governor: Feature Flag 开启时创建并启动后台治理
+    if vector_store and settings.agent.memory_governor_enabled:
+        governor = MemoryGovernor(vector_store)
+        governor.start_background()
+        logger.info("租户 {} Memory Governor 已启动", safe_id[:8])
+
+    return TenantSession(
+        tenant_id=tenant_id,
+        vector_store=vector_store,
+        governor=governor,
+    )
 
 
 def create_conversation(
@@ -356,7 +399,14 @@ def create_conversation(
     memory.set_llm_client(shared.llm_client)
 
     # ContextBuilder 负责 Zone 分层上下文组装（KB/记忆临时注入，不污染对话历史）
-    context_builder = ContextBuilder()
+    context_builder = ContextBuilder(
+        environment_providers=[default_environment, tool_environment(shared.tool_registry)],
+    )
+
+    # Environment Adapter: Feature Flag 开启时包装 ToolRegistry
+    env_adapter = None
+    if settings.agent.env_adapter_enabled:
+        env_adapter = ToolEnvAdapter(shared.tool_registry)
 
     agent = ReActAgent(
         llm_client=shared.llm_client,
@@ -366,6 +416,7 @@ def create_conversation(
         vector_store=tenant.vector_store,
         knowledge_base=shared.knowledge_base,
         skill_router=shared.skill_router,
+        env_adapter=env_adapter,
     )
 
     conv = Conversation(
@@ -412,7 +463,13 @@ def restore_conversation(
     }
     memory.restore_from(memory_data)
 
-    context_builder = ContextBuilder()
+    context_builder = ContextBuilder(
+        environment_providers=[default_environment, tool_environment(shared.tool_registry)],
+    )
+
+    env_adapter = None
+    if settings.agent.env_adapter_enabled:
+        env_adapter = ToolEnvAdapter(shared.tool_registry)
 
     agent = ReActAgent(
         llm_client=shared.llm_client,
@@ -422,6 +479,7 @@ def restore_conversation(
         vector_store=tenant.vector_store,
         knowledge_base=shared.knowledge_base,
         skill_router=shared.skill_router,
+        env_adapter=env_adapter,
     )
 
     conv = Conversation(

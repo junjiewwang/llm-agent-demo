@@ -98,10 +98,15 @@ class ToolRegistry:
 
     管理所有可用工具，提供注册、查找、批量导出等功能。
     Agent 通过 ToolRegistry 获取可用工具列表和执行工具。
+
+    支持别名机制：通过 register_alias() 为工具注册标准化别名，
+    使 Skill 的 required_tools 可以使用通用名称（如 fs_read）
+    而非具体实现名称（如 file_reader），实现 Skill 与工具实现的解耦。
     """
 
     def __init__(self):
         self._tools: Dict[str, BaseTool] = {}
+        self._aliases: Dict[str, str] = {}  # alias → canonical name
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
         """注册工具，支持链式调用。"""
@@ -110,11 +115,38 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return self
 
+    def register_alias(self, alias: str, target: str) -> "ToolRegistry":
+        """为已注册的工具注册别名，支持链式调用。
+
+        别名用于 Skill 的 required_tools 校验和运行时工具查找，
+        使 Skill 声明与工具实现名称解耦。
+
+        Args:
+            alias: 别名（如 'fs_read'）。
+            target: 目标工具的真实名称（如 'file_reader'），必须已注册。
+
+        Raises:
+            ValueError: 别名与已有工具名或别名冲突，或目标工具未注册。
+        """
+        if alias in self._tools:
+            raise ValueError(f"别名 '{alias}' 与已注册工具名冲突")
+        if alias in self._aliases:
+            raise ValueError(f"别名 '{alias}' 已存在（指向 '{self._aliases[alias]}'）")
+        if target not in self._tools:
+            raise ValueError(f"目标工具 '{target}' 未注册，无法创建别名 '{alias}'")
+        self._aliases[alias] = target
+        return self
+
+    def _resolve(self, name: str) -> str:
+        """将名称解析为真实工具名（若为别名则转换，否则原样返回）。"""
+        return self._aliases.get(name, name)
+
     def get(self, name: str) -> BaseTool:
-        """根据名称获取工具。"""
-        if name not in self._tools:
+        """根据名称或别名获取工具。"""
+        canonical = self._resolve(name)
+        if canonical not in self._tools:
             raise KeyError(f"工具 '{name}' 未注册，可用工具: {list(self._tools.keys())}")
-        return self._tools[name]
+        return self._tools[canonical]
 
     def execute(self, name: str, **kwargs) -> ToolResult:
         """执行指定工具，返回结构化结果。
@@ -123,12 +155,13 @@ class ToolRegistry:
         成功时通过 ToolResult.ok() 自动执行智能截断。
         每次执行创建 tool.execute.{name} span 用于可观测性。
         """
+        canonical = self._resolve(name)
         try:
-            tool = self.get(name)
+            tool = self.get(canonical)
         except KeyError as e:
             return ToolResult.fail(str(e))
 
-        with trace_span(_tracer, f"tool.execute.{name}", {"tool.name": name}) as span:
+        with trace_span(_tracer, f"tool.execute.{canonical}", {"tool.name": canonical}) as span:
             set_span_content(span, "tool.input", str(kwargs))
             try:
                 raw_output = tool.execute(**kwargs)
@@ -137,7 +170,7 @@ class ToolRegistry:
                 set_span_content(span, "tool.output", result.to_message()[:500])
                 return result
             except Exception as e:
-                result = ToolResult.fail(f"工具 '{name}' 执行失败: {e}")
+                result = ToolResult.fail(f"工具 '{canonical}' 执行失败: {e}")
                 span.set_attribute("tool.success", False)
                 span.set_attribute("tool.error", str(e))
                 return result
@@ -148,8 +181,35 @@ class ToolRegistry:
 
     @property
     def tool_names(self):
-        """返回所有已注册工具名称。"""
-        return list(self._tools.keys())
+        """返回所有已注册工具名称（含别名）。"""
+        return list(self._tools.keys()) + list(self._aliases.keys())
+
+    def get_tools_summary(self) -> str:
+        """生成可读的工具列表摘要，用于注入 LLM 上下文。
+
+        格式示例：
+            已注册工具（共 6 个）：
+            - calculator: 数学计算器
+            - file_reader (别名: fs_read): 读取文件内容
+        """
+        # 构建反向别名映射：canonical → [alias1, alias2]
+        reverse_aliases: Dict[str, list] = {}
+        for alias, canonical in self._aliases.items():
+            reverse_aliases.setdefault(canonical, []).append(alias)
+
+        lines = [f"已注册工具（共 {len(self._tools)} 个）："]
+        for name, tool in self._tools.items():
+            aliases = reverse_aliases.get(name)
+            alias_suffix = f" (别名: {', '.join(sorted(aliases))})" if aliases else ""
+            # 取 description 第一句作为简要说明
+            desc = tool.description.split("。")[0].split("\n")[0].strip()
+            lines.append(f"- {name}{alias_suffix}: {desc}")
+
+        return "\n".join(lines)
 
     def __len__(self) -> int:
         return len(self._tools)
+
+    def __contains__(self, name: str) -> bool:
+        """支持 `name in registry` 检查（含别名）。"""
+        return name in self._tools or name in self._aliases
