@@ -26,6 +26,9 @@
   --brand-border: #e2e8f0;
   --brand-border-light: #f1f5f9;
 
+  /* 上下文指示器 hover 背景 */
+  --ctx-hover-bg: rgba(229, 231, 235, 0.6);
+
   /* 字体 */
   --font-heading: 'Inter', 'Noto Sans SC', system-ui, sans-serif;
   --font-body: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
@@ -52,6 +55,9 @@
 
   --brand-border: #334155;
   --brand-border-light: #1e293b;
+
+  /* 上下文指示器 hover 背景 */
+  --ctx-hover-bg: rgba(31, 41, 55, 0.6);
 }
 
 /* 全局字体 */

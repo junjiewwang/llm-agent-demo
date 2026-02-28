@@ -5,6 +5,7 @@
  * 支持自动伸缩（最大 240px）和手动拖拽（最大 50vh）。
  */
 import { useState, useRef, useEffect, useCallback } from 'react'
+import ContextUsageIndicator from './ContextUsageIndicator'
 
 interface Props {
   onSend: (message: string) => void
@@ -97,8 +98,9 @@ export default function InputBox({ onSend, onStop, isStreaming, disabled }: Prop
               Shift+Enter 换行
             </span>
 
-            {/* 右侧按钮 */}
-            <div className="pointer-events-auto">
+            {/* 右侧：上下文指示器 + 发送按钮 */}
+            <div className="pointer-events-auto flex items-center gap-2">
+              <ContextUsageIndicator />
               {isStreaming ? (
                 <button
                   onClick={onStop}
