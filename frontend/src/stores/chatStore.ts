@@ -2,12 +2,28 @@
  * 聊天 Store
  *
  * 管理当前对话的消息列表、思考过程事件流和流式状态。
+ * Plan 模式下，子循环事件会嵌套到对应步骤节点的 children 中（树形结构）。
  */
 import { create } from 'zustand'
 import type { ChatMessage, ThinkingNode, StatusInfo, ToolConfirmEvent } from '../types'
 import { chatSSE } from '../api/sse'
 import { stopChat as apiStopChat, confirmTool as apiConfirmTool } from '../api/client'
 import { syncDoneEvent } from './actions'
+
+/** Plan 执行进度 */
+export interface PlanProgress {
+  totalSteps: number
+  currentStep: number
+  currentDescription: string
+  completedSteps: number
+  steps: { id: string; description: string; status: string }[]
+}
+
+/** Plan 模式下的子循环事件类型（会嵌套到步骤 children 中） */
+const PLAN_CHILD_EVENT_TYPES = new Set([
+  'thinking', 'tool_call', 'tool_confirm', 'tool_result',
+  'answering', 'max_iterations', 'error',
+])
 
 interface ChatState {
   messages: ChatMessage[]
@@ -17,6 +33,10 @@ interface ChatState {
   status: StatusInfo | null
   /** 当前等待用户确认的工具执行事件 */
   pendingConfirm: ToolConfirmEvent | null
+  /** 临时状态提示消息（如上下文压缩进度） */
+  statusMessage: string | null
+  /** Plan 模式执行进度（null = 非 Plan 模式） */
+  planProgress: PlanProgress | null
 
   setMessages: (msgs: ChatMessage[]) => void
   setStatus: (status: StatusInfo) => void
@@ -37,6 +57,8 @@ export const useChatStore = create<ChatState>((set) => ({
   streamingAnswer: '',
   status: null,
   pendingConfirm: null,
+  statusMessage: null,
+  planProgress: null,
 
   setMessages: (msgs) => set({ messages: msgs }),
   setStatus: (status) => set({ status }),
@@ -49,19 +71,133 @@ export const useChatStore = create<ChatState>((set) => ({
       isStreaming: true,
       streamingAnswer: '',
       pendingConfirm: null,
+      planProgress: null,
     }))
 
     abortController = chatSSE(tenantId, message, {
       onEvent: (event) => {
+        // --- Plan 模式事件路由 ---
+
+        // plan_created: 初始化 planProgress，创建顶层计划节点
+        if (event.type === 'plan_created') {
+          const planSteps = event.plan.steps.map((s) => ({
+            id: s.id,
+            description: s.description,
+            status: s.status,
+          }))
+          set((s) => ({
+            planProgress: {
+              totalSteps: event.total_steps,
+              currentStep: 0,
+              currentDescription: '',
+              completedSteps: 0,
+              steps: planSteps,
+            },
+            thinkingNodes: [
+              ...s.thinkingNodes,
+              { id: `node-${++nodeCounter}`, event },
+            ],
+          }))
+          return
+        }
+
+        // step_start: 更新进度，创建步骤节点（带空 children 数组，后续子循环事件挂载于此）
+        if (event.type === 'step_start') {
+          const stepNode: ThinkingNode = {
+            id: `node-${++nodeCounter}`,
+            event,
+            children: [],
+          }
+          set((s) => ({
+            planProgress: s.planProgress
+              ? {
+                  ...s.planProgress,
+                  currentStep: event.step_index + 1,
+                  currentDescription: event.message,
+                  steps: s.planProgress.steps.map((step, i) =>
+                    i === event.step_index ? { ...step, status: 'running' } : step,
+                  ),
+                }
+              : null,
+            thinkingNodes: [...s.thinkingNodes, stepNode],
+          }))
+          return
+        }
+
+        // step_done: 更新进度和步骤状态
+        if (event.type === 'step_done') {
+          set((s) => ({
+            planProgress: s.planProgress
+              ? {
+                  ...s.planProgress,
+                  completedSteps: s.planProgress.completedSteps + (event.step_status === 'completed' ? 1 : 0),
+                  steps: s.planProgress.steps.map((step, i) =>
+                    i === event.step_index ? { ...step, status: event.step_status } : step,
+                  ),
+                }
+              : null,
+            thinkingNodes: [
+              ...s.thinkingNodes,
+              { id: `node-${++nodeCounter}`, event },
+            ],
+          }))
+          return
+        }
+
+        // replan: 更新进度（步骤列表会在下一次 plan_created 重建）
+        if (event.type === 'replan') {
+          set((s) => ({
+            thinkingNodes: [
+              ...s.thinkingNodes,
+              { id: `node-${++nodeCounter}`, event },
+            ],
+          }))
+          return
+        }
+
+        // --- Plan 模式下子循环事件嵌套到当前步骤的 children ---
+        const currentPlanProgress = useChatStore.getState().planProgress
+        if (currentPlanProgress && PLAN_CHILD_EVENT_TYPES.has(event.type)) {
+          const childNode: ThinkingNode = {
+            id: `node-${++nodeCounter}`,
+            event,
+          }
+          set((s) => {
+            // 找到最后一个 step_start 节点，将子事件挂到其 children
+            const nodes = [...s.thinkingNodes]
+            for (let i = nodes.length - 1; i >= 0; i--) {
+              if (nodes[i].event.type === 'step_start' && nodes[i].children) {
+                nodes[i] = {
+                  ...nodes[i],
+                  children: [...(nodes[i].children || []), childNode],
+                }
+                return { thinkingNodes: nodes }
+              }
+            }
+            // 兜底：未找到步骤节点，直接追加到根层级
+            return { thinkingNodes: [...nodes, childNode] }
+          })
+
+          // 确认事件仍需设置 pendingConfirm
+          if (event.type === 'tool_confirm') {
+            set({ pendingConfirm: event })
+          }
+          return
+        }
+
+        // --- 非 Plan 模式：保持原有扁平逻辑 ---
         const node: ThinkingNode = {
           id: `node-${++nodeCounter}`,
           event,
         }
         set((s) => ({ thinkingNodes: [...s.thinkingNodes, node] }))
 
-        // 如果是确认事件，设置 pendingConfirm 状态
         if (event.type === 'tool_confirm') {
           set({ pendingConfirm: event })
+        }
+
+        if (event.type === 'status') {
+          set({ statusMessage: event.message })
         }
       },
 
@@ -81,7 +217,7 @@ export const useChatStore = create<ChatState>((set) => ({
             }
           }
         }
-        set({ isStreaming: false, pendingConfirm: null })
+        set({ isStreaming: false, pendingConfirm: null, statusMessage: null, planProgress: null })
         syncDoneEvent(history, data.conversations, data.status)
         abortController = null
       },
@@ -95,6 +231,8 @@ export const useChatStore = create<ChatState>((set) => ({
           messages: [...s.messages, errorMsg],
           isStreaming: false,
           pendingConfirm: null,
+          statusMessage: null,
+          planProgress: null,
         }))
         abortController = null
       },
@@ -115,10 +253,12 @@ export const useChatStore = create<ChatState>((set) => ({
       isStreaming: false,
       streamingAnswer: '',
       pendingConfirm: null,
+      statusMessage: null,
+      planProgress: null,
     }))
   },
 
-  clearThinking: () => set({ thinkingNodes: [] }),
+  clearThinking: () => set({ thinkingNodes: [], planProgress: null }),
 
   handleConfirm: async (confirmId, approved) => {
     try {
