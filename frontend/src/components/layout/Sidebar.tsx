@@ -6,6 +6,17 @@ import { useSessionStore } from '../../stores/sessionStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useUIStore } from '../../stores/uiStore'
 
+/** 格式化相对时间 */
+function relativeTime(ts?: number): string {
+  if (!ts) return ''
+  const diff = Date.now() / 1000 - ts
+  if (diff < 60) return '刚刚'
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+  if (diff < 604800) return `${Math.floor(diff / 86400)} 天前`
+  return new Date(ts * 1000).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+}
+
 export default function Sidebar() {
   const tenantId = useSessionStore((s) => s.tenantId)
   const { conversations, activeId, createConversation, switchConversation, deleteConversation } =
@@ -67,14 +78,14 @@ export default function Sidebar() {
               key={conv.id}
               onClick={() => handleSwitch(conv.id)}
               title={conv.title}
-              className={`group flex items-center ${sidebarCollapsed ? 'justify-center px-2' : 'gap-2 px-3'} py-2.5 rounded-lg cursor-pointer text-sm transition-colors ${
+              className={`group flex items-start ${sidebarCollapsed ? 'justify-center px-2 items-center' : 'gap-2 px-3'} py-2.5 rounded-lg cursor-pointer text-sm transition-colors ${
                 conv.id === activeId
                   ? 'text-indigo-700 dark:text-indigo-300 font-medium'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
               }`}
               style={conv.id === activeId ? { backgroundColor: 'var(--brand-primary-light)' } : undefined}
             >
-              <svg className="w-4 h-4 flex-shrink-0 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="w-4 h-4 flex-shrink-0 opacity-60 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path
                   strokeLinecap="round"
                   strokeLinejoin="round"
@@ -82,11 +93,18 @@ export default function Sidebar() {
                   d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"
                 />
               </svg>
-              {!sidebarCollapsed && <span className="truncate flex-1">{conv.title}</span>}
+              {!sidebarCollapsed && (
+                <div className="flex-1 min-w-0">
+                  <span className="truncate block">{conv.title}</span>
+                  {conv.created_at && (
+                    <span className="text-[11px] text-gray-400 dark:text-gray-500 block mt-0.5">{relativeTime(conv.created_at)}</span>
+                  )}
+                </div>
+              )}
               {!sidebarCollapsed && (
                 <button
                   onClick={(e) => handleDelete(e, conv.id)}
-                  className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-gray-400 hover:text-red-500 transition-all"
+                  className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-gray-400 hover:text-red-500 transition-all mt-0.5"
                   title="删除对话"
                 >
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
