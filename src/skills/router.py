@@ -9,6 +9,7 @@
 
 from typing import List, Optional
 
+from src.config import settings
 from src.skills.base import Skill, SkillMatchResult
 from src.skills.registry import SkillRegistry
 from src.utils.logger import logger
@@ -67,6 +68,13 @@ class SkillRouter:
                 candidates.append(result)
 
         if not candidates:
+            return []
+
+        # 过滤低分候选（避免宽泛关键词误触发）
+        min_score = settings.agent.skill_min_match_score
+        candidates = [m for m in candidates if m.score >= min_score]
+        if not candidates:
+            logger.debug("所有 Skill 匹配分数低于阈值 {}", min_score)
             return []
 
         # 排序：分数高优先，同分时 priority 小优先
