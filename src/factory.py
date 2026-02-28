@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 
 from src.agent import ReActAgent
+from src.agent.base_agent import BaseAgent
+from src.agent.plan_execute_agent import PlanExecuteAgent
 from src.context import ContextBuilder
 from src.context.builder import default_environment, tool_environment
 from src.environment.tool_env_adapter import ToolEnvAdapter
@@ -28,13 +30,11 @@ from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
 from src.tools.devops import CommandSandbox, CommandPolicy, KubectlTool, DockerTool, CurlTool
 from src.tools.devops.curl_tool import HttpRequestPolicy, HttpSandbox
 from src.tools.devops.kubectl_tool import (
-    L0_READONLY as _K8S_L0,
     ALL_SUBCOMMANDS as _K8S_ALL,
     BLOCKED_FLAGS as _K8S_BLOCKED,
     SENSITIVE_RESOURCES as _K8S_SENSITIVE,
 )
 from src.tools.devops.docker_tool import (
-    L0_READONLY as _DOCKER_RO,
     ALL_SUBCOMMANDS as _DOCKER_ALL,
     BLOCKED_FLAGS as _DOCKER_BLOCKED,
 )
@@ -78,7 +78,7 @@ class Conversation:
     id: str
     title: str
     memory: ConversationMemory
-    agent: ReActAgent
+    agent: BaseAgent  # ReActAgent 或 PlanExecuteAgent
     created_at: float = field(default_factory=time.time)
     chat_history: List[dict] = field(default_factory=list)
 
@@ -117,7 +117,7 @@ class TenantSession:
             reverse=True,
         )
         return [
-            {"id": c.id, "title": c.title, "active": c.id == self.active_conv_id}
+            {"id": c.id, "title": c.title, "active": c.id == self.active_conv_id, "created_at": c.created_at}
             for c in convs
         ]
 
@@ -174,14 +174,17 @@ def create_tool_registry(knowledge_base: Optional[KnowledgeBase]) -> ToolRegistr
 
 
 def _register_devops_tools(registry: ToolRegistry) -> None:
-    """按配置注册 DevOps 工具（kubectl / docker）。"""
+    """按配置注册 DevOps 工具（kubectl / docker / curl）。
+
+    所有工具均以全功能模式注册，写操作和危险操作的安全由
+    tool_confirm_mode（Human-in-the-loop）确认机制保障。
+    """
     devops_config = settings.devops
 
     if devops_config.kubectl_enabled:
-        allowed_subs = _K8S_ALL if not devops_config.kubectl_read_only else _K8S_L0
         policy = CommandPolicy(
             binary="kubectl",
-            allowed_subcommands=allowed_subs,
+            allowed_subcommands=_K8S_ALL,
             blocked_flags=_K8S_BLOCKED,
             sensitive_resources=_K8S_SENSITIVE,
             timeout=devops_config.kubectl_timeout,
@@ -193,37 +196,23 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
             if ns.strip()
         ] or None
         registry.register(
-            KubectlTool(
-                sandbox=sandbox,
-                enable_write=not devops_config.kubectl_read_only,
-                allowed_namespaces=ns_list,
-            )
+            KubectlTool(sandbox=sandbox, allowed_namespaces=ns_list)
         )
         logger.info(
-            "kubectl 工具已注册 (只读={}, namespace限制={})",
-            devops_config.kubectl_read_only,
+            "kubectl 工具已注册 (namespace限制={})",
             ns_list or "无",
         )
 
     if devops_config.docker_enabled:
-        allowed_subs = _DOCKER_ALL if not devops_config.docker_read_only else _DOCKER_RO
         policy = CommandPolicy(
             binary="docker",
-            allowed_subcommands=allowed_subs,
+            allowed_subcommands=_DOCKER_ALL,
             blocked_flags=_DOCKER_BLOCKED,
             timeout=devops_config.docker_timeout,
         )
         sandbox = CommandSandbox(policy)
-        registry.register(
-            DockerTool(
-                sandbox=sandbox,
-                enable_write=not devops_config.docker_read_only,
-            )
-        )
-        logger.info(
-            "docker 工具已注册 (只读={})",
-            devops_config.docker_read_only,
-        )
+        registry.register(DockerTool(sandbox=sandbox))
+        logger.info("docker 工具已注册")
 
     if devops_config.curl_enabled:
         allowed_hosts = frozenset(
@@ -237,15 +226,9 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
             max_response_bytes=devops_config.curl_max_response_bytes,
         )
         http_sandbox = HttpSandbox(http_policy)
-        registry.register(
-            CurlTool(
-                sandbox=http_sandbox,
-                enable_write=not devops_config.curl_read_only,
-            )
-        )
+        registry.register(CurlTool(sandbox=http_sandbox))
         logger.info(
-            "curl 工具已注册 (只读={}, host限制={})",
-            devops_config.curl_read_only,
+            "curl 工具已注册 (host限制={})",
             sorted(allowed_hosts) if allowed_hosts else "无",
         )
 
@@ -315,6 +298,7 @@ def _log_feature_flags() -> None:
     lines = [
         "Feature Flags 状态:",
         f"  message_usage    = {_flag(cfg.message_usage_enabled)}",
+        f"  plan_execute     = {_flag(cfg.plan_execute_enabled)}",
         f"  policy           = {_flag(cfg.policy_enabled)}",
         f"  memory_governor  = {_flag(cfg.memory_governor_enabled)}"
         f"  (interval={cfg.memory_governor_interval}s,"
@@ -382,6 +366,36 @@ def create_tenant_session(tenant_id: str) -> TenantSession:
     )
 
 
+def _create_agent(
+    shared: SharedComponents,
+    tenant: TenantSession,
+    memory: ConversationMemory,
+    context_builder: ContextBuilder,
+    env_adapter=None,
+) -> BaseAgent:
+    """根据 feature flag 创建 ReActAgent 或 PlanExecuteAgent。
+
+    共享相同的构造参数，唯一差异是 Agent 类型。
+    plan_execute_enabled=True 时创建 PlanExecuteAgent，否则创建 ReActAgent。
+    """
+    common_kwargs = dict(
+        llm_client=shared.llm_client,
+        tool_registry=shared.tool_registry,
+        memory=memory,
+        context_builder=context_builder,
+        vector_store=tenant.vector_store,
+        knowledge_base=shared.knowledge_base,
+        skill_router=shared.skill_router,
+        env_adapter=env_adapter,
+    )
+
+    if settings.agent.plan_execute_enabled:
+        logger.debug("创建 PlanExecuteAgent")
+        return PlanExecuteAgent(**common_kwargs)
+
+    return ReActAgent(**common_kwargs)
+
+
 def create_conversation(
     shared: SharedComponents,
     tenant: TenantSession,
@@ -401,6 +415,7 @@ def create_conversation(
     # ContextBuilder 负责 Zone 分层上下文组装（KB/记忆临时注入，不污染对话历史）
     context_builder = ContextBuilder(
         environment_providers=[default_environment, tool_environment(shared.tool_registry)],
+        model=shared.llm_client.model,
     )
 
     # Environment Adapter: Feature Flag 开启时包装 ToolRegistry
@@ -408,14 +423,11 @@ def create_conversation(
     if settings.agent.env_adapter_enabled:
         env_adapter = ToolEnvAdapter(shared.tool_registry)
 
-    agent = ReActAgent(
-        llm_client=shared.llm_client,
-        tool_registry=shared.tool_registry,
+    agent = _create_agent(
+        shared=shared,
+        tenant=tenant,
         memory=memory,
         context_builder=context_builder,
-        vector_store=tenant.vector_store,
-        knowledge_base=shared.knowledge_base,
-        skill_router=shared.skill_router,
         env_adapter=env_adapter,
     )
 
@@ -465,20 +477,18 @@ def restore_conversation(
 
     context_builder = ContextBuilder(
         environment_providers=[default_environment, tool_environment(shared.tool_registry)],
+        model=shared.llm_client.model,
     )
 
     env_adapter = None
     if settings.agent.env_adapter_enabled:
         env_adapter = ToolEnvAdapter(shared.tool_registry)
 
-    agent = ReActAgent(
-        llm_client=shared.llm_client,
-        tool_registry=shared.tool_registry,
+    agent = _create_agent(
+        shared=shared,
+        tenant=tenant,
         memory=memory,
         context_builder=context_builder,
-        vector_store=tenant.vector_store,
-        knowledge_base=shared.knowledge_base,
-        skill_router=shared.skill_router,
         env_adapter=env_adapter,
     )
 

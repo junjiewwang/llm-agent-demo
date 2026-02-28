@@ -36,6 +36,7 @@ from src.factory import (
     restore_conversation,
     create_command_registry,
 )
+from src.memory.conversation import CompressionError
 from src.observability.instruments import start_thread_with_context
 from src.persistence import SessionStore
 from src.utils.logger import logger
@@ -376,6 +377,9 @@ class AgentService:
                 )
             except AgentStoppedError:
                 result_holder[1] = AgentStoppedError("用户停止了对话")
+            except CompressionError as e:
+                logger.error("上下文压缩失败: {}", e)
+                result_holder[1] = e
             except Exception as e:
                 result_holder[1] = e
             event_queue.put(_SENTINEL)
@@ -604,7 +608,9 @@ class AgentService:
             {
                 "initialized": bool,
                 "model": str?,
-                "current_conversation": {id, title, memory_tokens}?,
+                "context_window": int,
+                "max_output_tokens": int,
+                "current_conversation": {id, title, memory_tokens, context_used_tokens}?,
                 "conversation_count": int,
                 "long_term_memory_count": int,
                 "knowledge_base_chunks": int,
@@ -617,6 +623,8 @@ class AgentService:
         status: dict = {
             "initialized": True,
             "model": self._shared.llm_client.model,
+            "context_window": settings.llm.context_window,
+            "max_output_tokens": settings.agent.max_tokens,
             "conversation_count": len(tenant.conversations) if tenant else 0,
             "long_term_memory_count": 0,
             "knowledge_base_chunks": 0,
@@ -625,11 +633,34 @@ class AgentService:
         if tenant:
             conv = tenant.get_active_conversation()
             if conv:
-                status["current_conversation"] = {
+                # 获取最近一次 build 的完整上下文 Token 统计
+                build_stats = conv.agent.context_builder.last_build_stats
+                conv_status: dict = {
                     "id": conv.id,
                     "title": conv.title,
                     "memory_tokens": conv.memory.token_count,
+                    "context_used_tokens": build_stats.total_tokens if build_stats else conv.memory.token_count,
+                    "history_budget": build_stats.history_budget if build_stats else 0,
+                    "compression_count": conv.memory.compression_count,
                 }
+                # Sprint 3: Zone 级别 Token 分布
+                if build_stats:
+                    conv_status["zone_breakdown"] = {
+                        "system_tokens": build_stats.system_tokens,
+                        "environment_tokens": build_stats.environment_tokens,
+                        "skill_tokens": build_stats.skill_tokens,
+                        "knowledge_tokens": build_stats.knowledge_tokens,
+                        "memory_tokens": build_stats.memory_tokens,
+                        "history_tokens": build_stats.history_tokens,
+                        "input_budget": build_stats.input_budget,
+                        "skill_budget": build_stats.skill_budget,
+                        "knowledge_budget": build_stats.knowledge_budget,
+                        "memory_budget": build_stats.memory_budget,
+                        "skill_truncated": build_stats.skill_truncated,
+                        "knowledge_truncated": build_stats.knowledge_truncated,
+                        "memory_truncated": build_stats.memory_truncated,
+                    }
+                status["current_conversation"] = conv_status
             if tenant.vector_store:
                 status["long_term_memory_count"] = tenant.vector_store.count()
 

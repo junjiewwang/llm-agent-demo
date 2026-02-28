@@ -34,6 +34,11 @@ def _agent_event_to_sse(event: AgentEvent) -> dict:
         EventType.ANSWERING: SSEEventType.ANSWERING,
         EventType.MAX_ITERATIONS: SSEEventType.MAX_ITERATIONS,
         EventType.ERROR: SSEEventType.ERROR,
+        EventType.STATUS: SSEEventType.STATUS,
+        EventType.PLAN_CREATED: SSEEventType.PLAN_CREATED,
+        EventType.STEP_START: SSEEventType.STEP_START,
+        EventType.STEP_DONE: SSEEventType.STEP_DONE,
+        EventType.REPLAN: SSEEventType.REPLAN,
     }
     sse_type = event_type_map.get(event.type, SSEEventType.ERROR)
 
@@ -68,6 +73,35 @@ def _agent_event_to_sse(event: AgentEvent) -> dict:
         data = {"message": "达到最大迭代次数，正在总结"}
     elif event.type == EventType.ERROR:
         data = {"message": event.message}
+    elif event.type == EventType.STATUS:
+        data = {"message": event.message}
+    elif event.type == EventType.PLAN_CREATED:
+        data = {
+            "plan": event.plan,
+            "total_steps": event.total_steps,
+            "message": event.message,
+        }
+    elif event.type == EventType.STEP_START:
+        data = {
+            "step_id": event.step_id,
+            "step_index": event.step_index,
+            "total_steps": event.total_steps,
+            "message": event.message,
+        }
+    elif event.type == EventType.STEP_DONE:
+        data = {
+            "step_id": event.step_id,
+            "step_index": event.step_index,
+            "total_steps": event.total_steps,
+            "step_status": event.step_status,
+            "message": event.message,
+        }
+    elif event.type == EventType.REPLAN:
+        data = {
+            "step_index": event.step_index,
+            "total_steps": event.total_steps,
+            "message": event.message,
+        }
 
     return {"event": sse_type.value, "data": json.dumps(data, ensure_ascii=False)}
 

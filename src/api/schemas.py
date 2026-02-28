@@ -24,10 +24,16 @@ class SSEEventType(str, Enum):
     DONE = "done"
     ERROR = "error"
     MAX_ITERATIONS = "max_iterations"
+    STATUS = "status"  # 状态提示（如上下文压缩进度）
 
     # 预留扩展
     ANSWER_TOKEN = "answer_token"  # 流式 token（未来 LLM 逐 token 输出）
-    PLAN = "plan"  # 任务分解（未来 Plan-and-Execute 模式）
+
+    # Plan-and-Execute 事件
+    PLAN_CREATED = "plan_created"  # 计划生成完成
+    STEP_START = "step_start"  # 开始执行某一步
+    STEP_DONE = "step_done"  # 某一步执行完成
+    REPLAN = "replan"  # 重新规划
 
 
 # ── 通用响应信封 ──
@@ -61,6 +67,7 @@ class ConversationInfo(BaseModel):
     id: str
     title: str
     active: bool = False
+    created_at: Optional[float] = None
 
 
 class StatusInfo(BaseModel):
@@ -68,6 +75,8 @@ class StatusInfo(BaseModel):
 
     initialized: bool = False
     model: Optional[str] = None
+    context_window: int = 0
+    max_output_tokens: int = 0
     current_conversation: Optional[Dict[str, Any]] = None
     conversation_count: int = 0
     long_term_memory_count: int = 0
