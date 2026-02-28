@@ -1,8 +1,7 @@
 """Docker 容器管理工具。
 
 通过 docker CLI 提供容器和镜像的查询、运维与诊断能力。
-默认只读模式，只允许查询类子命令；开启写模式后所有子命令可用，
-敏感操作通过 Human-in-the-loop 确认机制保障安全。
+所有子命令均可用，写操作和危险操作通过 Human-in-the-loop 确认机制保障安全。
 
 安全机制（三层防线）：
 - L0 只读子命令：直接执行，无需确认
@@ -52,16 +51,10 @@ class DockerTool(BaseTool):
 
     Args:
         sandbox: CommandSandbox 实例，负责安全执行。
-        enable_write: 是否启用写操作（默认 False，只读）。
     """
 
-    def __init__(
-        self,
-        sandbox: CommandSandbox,
-        enable_write: bool = False,
-    ):
+    def __init__(self, sandbox: CommandSandbox):
         self._sandbox = sandbox
-        self._enable_write = enable_write
 
     @property
     def name(self) -> str:
@@ -69,7 +62,7 @@ class DockerTool(BaseTool):
 
     @property
     def description(self) -> str:
-        base = (
+        return (
             "Docker 容器管理工具，查看和诊断本地 Docker 容器与镜像。\n"
             "支持的查询操作：\n"
             "- ps: 查看容器列表（默认只显示运行中的，加 --all 显示所有）\n"
@@ -83,36 +76,28 @@ class DockerTool(BaseTool):
             "- system df: 查看 Docker 磁盘使用\n"
             "- version: 查看 Docker 版本\n"
             "- info: 查看 Docker 系统信息\n"
-            "- compose ps: 查看 Compose 服务状态（需在项目目录下）"
+            "- compose ps: 查看 Compose 服务状态（需在项目目录下）\n\n"
+            "支持的运维操作（需确认后执行）：\n"
+            "- start/stop/restart: 容器生命周期管理\n"
+            "- exec: 在运行中的容器内执行命令\n"
+            "- run: 创建并运行新容器\n"
+            "- cp: 在容器与宿主机之间复制文件\n"
+            "- pull/build/tag/create: 镜像与容器构建\n\n"
+            "危险操作（需确认）：\n"
+            "- rm/rmi: 删除容器或镜像\n"
+            "- kill: 强制终止容器\n"
+            "- prune: 清理未使用的资源\n"
+            "- push: 推送镜像到远程仓库"
         )
-        if self._enable_write:
-            base += (
-                "\n\n支持的运维操作（需确认后执行）：\n"
-                "- start/stop/restart: 容器生命周期管理\n"
-                "- exec: 在运行中的容器内执行命令\n"
-                "- run: 创建并运行新容器\n"
-                "- cp: 在容器与宿主机之间复制文件\n"
-                "- pull/build/tag/create: 镜像与容器构建\n"
-                "\n危险操作（需确认）：\n"
-                "- rm/rmi: 删除容器或镜像\n"
-                "- kill: 强制终止容器\n"
-                "- prune: 清理未使用的资源\n"
-                "- push: 推送镜像到远程仓库"
-            )
-        return base
 
     @property
     def parameters(self) -> Dict[str, Any]:
-        subcommands = sorted(L0_READONLY)
-        if self._enable_write:
-            subcommands = sorted(ALL_SUBCOMMANDS)
-
         return {
             "type": "object",
             "properties": {
                 "subcommand": {
                     "type": "string",
-                    "enum": subcommands,
+                    "enum": sorted(ALL_SUBCOMMANDS),
                     "description": (
                         "docker 子命令。对于复合命令用空格连接，"
                         "如 'network ls'、'compose ps'、'system df'"

@@ -1,8 +1,7 @@
 """Kubernetes 集群管理工具。
 
 通过 kubectl CLI 提供 K8s 资源的查询、运维和诊断能力。
-默认只读模式，只允许查询类子命令；开启写模式后所有子命令可用，
-敏感操作通过 Human-in-the-loop 确认机制保障安全。
+所有子命令均可用，写操作和危险操作通过 Human-in-the-loop 确认机制保障安全。
 
 安全机制（三层防线）：
 - L0 只读子命令：直接执行，无需确认
@@ -60,18 +59,15 @@ class KubectlTool(BaseTool):
 
     Args:
         sandbox: CommandSandbox 实例，负责安全执行。
-        enable_write: 是否启用写操作（默认 False，只读）。
         allowed_namespaces: 允许访问的 namespace 列表（None=全部允许）。
     """
 
     def __init__(
         self,
         sandbox: CommandSandbox,
-        enable_write: bool = False,
         allowed_namespaces: Optional[List[str]] = None,
     ):
         self._sandbox = sandbox
-        self._enable_write = enable_write
         self._allowed_namespaces = (
             set(allowed_namespaces) if allowed_namespaces else None
         )
@@ -82,7 +78,7 @@ class KubectlTool(BaseTool):
 
     @property
     def description(self) -> str:
-        base = (
+        return (
             "Kubernetes 集群管理工具，通过 kubectl 查询和诊断 K8s 资源。\n"
             "支持的查询操作：\n"
             "- get: 列出资源（pods, services, deployments, nodes, configmaps 等）\n"
@@ -94,42 +90,34 @@ class KubectlTool(BaseTool):
             "- version: 查看客户端和服务端版本\n"
             "- cluster-info: 查看集群信息\n"
             "- diff: 对比本地资源定义与集群当前状态的差异\n"
-            "- auth: 检查权限（如 auth can-i list pods）"
+            "- auth: 检查权限（如 auth can-i list pods）\n\n"
+            "支持的运维操作（需确认后执行）：\n"
+            "- apply: 应用资源配置（声明式）\n"
+            "- create: 创建资源（命令式）\n"
+            "- patch: 局部更新资源字段\n"
+            "- edit: 交互式编辑资源\n"
+            "- scale: 调整副本数\n"
+            "- rollout: 管理滚动更新（status/restart/undo/history）\n"
+            "- cordon/uncordon: 标记节点不可调度/恢复调度\n"
+            "- label/annotate: 添加/修改标签或注解\n"
+            "- taint: 设置节点污点\n"
+            "- exec: 在容器中执行命令\n"
+            "- cp: 在容器和本地之间复制文件\n"
+            "- port-forward: 端口转发\n\n"
+            "危险操作（需确认）：\n"
+            "- delete: 删除资源\n"
+            "- drain: 排空节点（驱逐所有 Pod）\n"
+            "- replace: 替换资源（先删后建）"
         )
-        if self._enable_write:
-            base += (
-                "\n\n支持的运维操作（需确认后执行）：\n"
-                "- apply: 应用资源配置（声明式）\n"
-                "- create: 创建资源（命令式）\n"
-                "- patch: 局部更新资源字段\n"
-                "- edit: 交互式编辑资源\n"
-                "- scale: 调整副本数\n"
-                "- rollout: 管理滚动更新（status/restart/undo/history）\n"
-                "- cordon/uncordon: 标记节点不可调度/恢复调度\n"
-                "- label/annotate: 添加/修改标签或注解\n"
-                "- taint: 设置节点污点\n"
-                "- exec: 在容器中执行命令\n"
-                "- cp: 在容器和本地之间复制文件\n"
-                "- port-forward: 端口转发\n"
-                "\n危险操作（需确认）：\n"
-                "- delete: 删除资源\n"
-                "- drain: 排空节点（驱逐所有 Pod）\n"
-                "- replace: 替换资源（先删后建）"
-            )
-        return base
 
     @property
     def parameters(self) -> Dict[str, Any]:
-        subcommands = sorted(L0_READONLY)
-        if self._enable_write:
-            subcommands = sorted(ALL_SUBCOMMANDS)
-
         return {
             "type": "object",
             "properties": {
                 "subcommand": {
                     "type": "string",
-                    "enum": subcommands,
+                    "enum": sorted(ALL_SUBCOMMANDS),
                     "description": "kubectl 子命令",
                 },
                 "resource_type": {
@@ -214,4 +202,15 @@ class KubectlTool(BaseTool):
             flags = flags_str.strip().split()
             args.extend(flags)
 
-        return self._sandbox.execute(subcommand, args)
+        output = self._sandbox.execute(subcommand, args)
+
+        # 空结果语义增强：帮助 LLM 理解空输出是正常状态，避免无效重试
+        if output == "(无输出)" and resource_type:
+            return (
+                f"(无输出)\n\n"
+                f"[提示] 查询 {resource_type} 返回空结果，"
+                f"这通常表示当前集群中没有匹配的 {resource_type} 资源。"
+                f"空结果本身就是有效信息，无需使用不同参数重试。"
+            )
+
+        return output

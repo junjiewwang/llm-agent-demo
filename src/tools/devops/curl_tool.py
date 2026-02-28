@@ -6,7 +6,7 @@
 - URL scheme 白名单：只允许 http/https，拦截 file:// gopher:// 等 SSRF 攻击
 - Host 校验：黑名单（云 metadata 端点）+ 可选白名单
 - 危险参数拦截：禁止文件写入（-o）、文件上传（-F）、代理（--proxy）等
-- 读写分级：只读模式仅允许 GET/HEAD/OPTIONS
+- 写操作（POST/PUT/DELETE/PATCH）通过 Human-in-the-loop 确认机制保障安全
 - 命令注入防御：shell=False + shell 元字符检测
 - 资源保护：超时控制 + 响应大小限制 + 输出截断
 """
@@ -326,16 +326,14 @@ class CurlTool(BaseTool):
     """HTTP 请求工具（基于 curl）。
 
     通过 curl CLI 发送 HTTP 请求，用于 API 调试、健康检查、接口探测。
-    默认只读模式（仅 GET/HEAD/OPTIONS），可配置开启写操作。
+    支持所有 HTTP 方法，写操作（POST/PUT/DELETE/PATCH）通过确认机制保障安全。
 
     Args:
         sandbox: HttpSandbox 实例，负责安全执行。
-        enable_write: 是否启用写操作方法（POST/PUT/DELETE/PATCH）。
     """
 
-    def __init__(self, sandbox: HttpSandbox, enable_write: bool = False):
+    def __init__(self, sandbox: HttpSandbox):
         self._sandbox = sandbox
-        self._enable_write = enable_write
 
     @property
     def name(self) -> str:
@@ -343,36 +341,26 @@ class CurlTool(BaseTool):
 
     @property
     def description(self) -> str:
-        base = (
+        return (
             "HTTP 请求工具，通过 curl 发送 HTTP 请求。\n"
             "适用场景：API 调试、健康检查、接口探测、获取远程数据。\n\n"
             "支持的只读操作：\n"
             "- GET: 获取资源（默认方法）\n"
             "- HEAD: 只获取响应头（检查可达性）\n"
-            "- OPTIONS: 查询支持的方法（CORS 预检）"
-        )
-        if self._enable_write:
-            base += (
-                "\n\n支持的写操作（已启用）：\n"
-                "- POST: 创建资源 / 提交数据\n"
-                "- PUT: 更新资源（全量替换）\n"
-                "- PATCH: 更新资源（部分修改）\n"
-                "- DELETE: 删除资源"
-            )
-        base += (
-            "\n\n安全限制：\n"
+            "- OPTIONS: 查询支持的方法（CORS 预检）\n\n"
+            "支持的写操作（需确认后执行）：\n"
+            "- POST: 创建资源 / 提交数据\n"
+            "- PUT: 更新资源（全量替换）\n"
+            "- PATCH: 更新资源（部分修改）\n"
+            "- DELETE: 删除资源\n\n"
+            "安全限制：\n"
             "- 只允许 http/https 协议\n"
             "- 不允许访问内网地址和云 metadata 端点\n"
             "- 不支持文件上传/下载到本地"
         )
-        return base
 
     @property
     def parameters(self) -> Dict[str, Any]:
-        methods = sorted(_READONLY_METHODS)
-        if self._enable_write:
-            methods = sorted(_READONLY_METHODS | _WRITE_METHODS)
-
         return {
             "type": "object",
             "properties": {
@@ -382,7 +370,7 @@ class CurlTool(BaseTool):
                 },
                 "method": {
                     "type": "string",
-                    "enum": methods,
+                    "enum": sorted(_READONLY_METHODS | _WRITE_METHODS),
                     "description": "HTTP 方法，默认 GET",
                 },
                 "headers": {
@@ -428,13 +416,6 @@ class CurlTool(BaseTool):
 
         if not url:
             raise RuntimeError("url 参数不能为空")
-
-        # 读写权限检查
-        if not self._enable_write and method not in _READONLY_METHODS:
-            raise RuntimeError(
-                f"当前为只读模式，不允许 {method} 请求。"
-                f"只允许: {sorted(_READONLY_METHODS)}"
-            )
 
         # 解析 headers（按行分割）
         headers = [h.strip() for h in headers_str.splitlines() if h.strip()]
