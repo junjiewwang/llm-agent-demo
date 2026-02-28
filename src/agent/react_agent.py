@@ -15,18 +15,15 @@
 - 检测到循环时自动插入引导 prompt，让 LLM 换种方式回答
 """
 
-import json
 import re
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from src.agent.base_agent import BaseAgent, OnEventCallback, WaitForConfirmation
 from src.agent.events import AgentEvent, AgentStoppedError, EventType
 from src.agent.loop_detector import LoopDetector
 from src.agent.metrics import RunMetrics
+from src.agent.tool_executor import ToolExecutorMixin
 from src.config import settings
 from src.context.builder import ContextBuilder
 from src.environment.adapter_base import EnvironmentAdapter
@@ -35,7 +32,7 @@ from src.memory.conversation import ConversationMemory
 from src.memory.vector_store import VectorStore
 from src.observability import get_tracer
 from src.observability.instruments import (
-    propagate_context, record_agent_run_metrics, trace_span,
+    record_agent_run_metrics, trace_span,
     set_span_content, set_span_distances,
 )
 from src.tools.base_tool import ToolRegistry
@@ -48,7 +45,7 @@ if TYPE_CHECKING:
 _tracer = get_tracer(__name__)
 
 
-class ReActAgent(BaseAgent):
+class ReActAgent(BaseAgent, ToolExecutorMixin):
     """ReAct (Reasoning + Acting) Agent。
 
     通过 LLM 的 Function Calling 能力，自主决定何时调用工具、
@@ -87,6 +84,11 @@ class ReActAgent(BaseAgent):
         self._max_tokens = max_tokens or settings.agent.max_tokens
         self._last_metrics: Optional[RunMetrics] = None
         self._loop_detector = LoopDetector()
+
+    @property
+    def context_builder(self) -> ContextBuilder:
+        """暴露 ContextBuilder 实例，供外部获取 build 统计信息。"""
+        return self._context_builder
 
     @property
     def last_metrics(self) -> Optional[RunMetrics]:
@@ -176,7 +178,13 @@ class ReActAgent(BaseAgent):
         # 4. 用户消息写入对话历史（这是真正应该持久化的）
         self._memory.add_user_message(user_input)
 
+        # 5. 检查是否需要压缩 History Zone（同步阻塞）
+        self._check_and_compress(_emit)
+
         tools_schema = self._tools.to_openai_tools() if len(self._tools) > 0 else None
+
+        # 将 tools schema 的 token 占用纳入上下文预算，避免 messages + tools 超限
+        self._context_builder.set_tools_reserve(tools_schema)
 
         for iteration in range(1, self._max_iterations + 1):
             metrics.iterations = iteration
@@ -220,7 +228,7 @@ class ReActAgent(BaseAgent):
 
             # 情况2: LLM 决定调用工具
             self._memory.add_assistant_message(response)
-            self._execute_tool_calls(response.tool_calls, metrics, _emit, wait_for_confirmation)
+            self.execute_tool_calls(response.tool_calls, metrics, _emit, wait_for_confirmation)
 
             # 循环检测：如果检测到重复调用模式，插入引导 prompt
             loop_hint = self._loop_detector.get_loop_summary()
@@ -363,6 +371,38 @@ class ReActAgent(BaseAgent):
         else:
             self._context_builder.set_skills([])
 
+    def _check_and_compress(self, _emit) -> None:
+        """检查 History Zone 是否超过水位线，需要时同步触发压缩。
+
+        在 ReAct 循环开始前调用。使用 ContextBuilder.estimate_compression_needed()
+        估算动态预算，超过阈值时调用 ConversationMemory.compress() 同步压缩。
+
+        压缩过程通过 STATUS 事件通知前端展示进度。
+        如果压缩失败，抛出 CompressionError，由上层 AgentService 捕获返回用户错误。
+        """
+        estimate = self._context_builder.estimate_compression_needed(self._memory.messages)
+        if not estimate:
+            return
+
+        logger.info(
+            "History Zone 超过水位线 | history={} tokens, budget={} tokens, 阈值={}",
+            estimate.history_tokens, estimate.history_budget,
+            settings.agent.compression_threshold,
+        )
+
+        _emit(AgentEvent(
+            type=EventType.STATUS,
+            message="🧠 正在整理长期记忆...",
+        ))
+
+        # 同步阻塞执行压缩（CompressionError 会自然向上传播）
+        self._memory.compress(target_tokens=estimate.target_tokens)
+
+        _emit(AgentEvent(
+            type=EventType.STATUS,
+            message="✅ 记忆整理完成",
+        ))
+
     def _store_to_long_term_memory(self, user_input: str, answer: str,
                                    metrics: Optional[RunMetrics] = None) -> None:
         """将对话中的关键事实提取并存储到长期记忆。
@@ -442,266 +482,6 @@ class ReActAgent(BaseAgent):
             logger.warning("关键事实提取失败: {}", e)
             return None
 
-    # 工具并发执行的最大线程数
-    _TOOL_MAX_WORKERS = 5
-
-    def _execute_tool_calls(
-        self, tool_calls, metrics: RunMetrics, emit=None,
-        wait_for_confirmation: WaitForConfirmation = None,
-    ):
-        """执行 LLM 请求的所有工具调用。
-
-        单个 tool_call 时串行执行；多个 tool_call 时并发执行以减少总耗时。
-        如果并发批次中有需要确认的工具，退化为串行以保证确认体验。
-        无论并发还是串行，结果都按原始顺序写入 Memory（保证上下文一致性）。
-        """
-        if len(tool_calls) == 1:
-            self._execute_single_tool(tool_calls[0], metrics, emit, wait_for_confirmation)
-            return
-
-        # 多个 tool_calls：检查是否有需要确认的工具
-        # 如果有，退化为串行执行（V1 简化策略，避免并发确认的 UX 复杂度）
-        if wait_for_confirmation and self._has_confirmable_tool(tool_calls):
-            logger.info("并发批次中有需要确认的工具，退化为串行执行")
-            for tc in tool_calls:
-                self._execute_single_tool(tc, metrics, emit, wait_for_confirmation)
-            return
-
-        # 多个 tool_calls 且无需确认：并发执行
-        total = len(tool_calls)
-        logger.info("并发执行 {} 个工具调用", total)
-
-        # 先发送所有 TOOL_CALL 事件 + 解析参数
-        parsed: List[Optional["_ParsedToolCall"]] = []
-        for idx, tc in enumerate(tool_calls):
-            p = self._parse_and_emit_tool_call(
-                tc, metrics, emit,
-                parallel_total=total, parallel_index=idx + 1,
-            )
-            parsed.append(p)
-
-        # 并发执行所有已成功解析的工具（propagate_context 确保子线程 span 关联到父 trace）
-        results: Dict[int, _ToolExecResult] = {}
-        with ThreadPoolExecutor(max_workers=min(len(tool_calls), self._TOOL_MAX_WORKERS)) as pool:
-            future_to_idx = {}
-            for i, p in enumerate(parsed):
-                if p is not None:
-                    future = pool.submit(
-                        propagate_context(self._tools.execute),
-                        p.func_name, **p.func_args,
-                    )
-                    future_to_idx[future] = i
-
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                p = parsed[idx]
-                assert p is not None
-                start_time = p.start_time
-                try:
-                    result = future.result()
-                    duration_ms = int((time.monotonic() - start_time) * 1000)
-                    results[idx] = _ToolExecResult(
-                        result=result, duration_ms=duration_ms,
-                    )
-                except Exception as e:
-                    duration_ms = int((time.monotonic() - start_time) * 1000)
-                    from src.tools.result import ToolResult
-                    results[idx] = _ToolExecResult(
-                        result=ToolResult.fail(f"工具执行异常: {e}"),
-                        duration_ms=duration_ms,
-                    )
-
-        # 按原始顺序写入 Memory 和发送事件（保证上下文一致性）
-        for i, tc in enumerate(tool_calls):
-            p = parsed[i]
-            if p is None:
-                continue  # 解析失败的已经在 _parse_and_emit_tool_call 中处理
-
-            exec_result = results.get(i)
-            if exec_result is None:
-                continue
-
-            self._record_tool_result(
-                tc, p, exec_result.result, exec_result.duration_ms, metrics, emit,
-                parallel_total=total, parallel_index=i + 1,
-            )
-
-    def _execute_single_tool(
-        self, tc, metrics: RunMetrics, emit=None,
-        wait_for_confirmation: WaitForConfirmation = None,
-    ):
-        """串行执行单个工具调用，支持确认拦截。"""
-        p = self._parse_and_emit_tool_call(tc, metrics, emit)
-        if p is None:
-            return
-
-        # 确认拦截：检查工具是否需要用户确认
-        result = self._maybe_confirm_and_execute(p, metrics, emit, wait_for_confirmation)
-        duration_ms = int((time.monotonic() - p.start_time) * 1000)
-        self._record_tool_result(tc, p, result, duration_ms, metrics, emit)
-
-    def _maybe_confirm_and_execute(
-        self, parsed: "_ParsedToolCall", metrics: RunMetrics, emit=None,
-        wait_for_confirmation: WaitForConfirmation = None,
-    ):
-        """确认拦截 + 执行工具。
-
-        如果工具需要确认且有确认回调，发送 TOOL_CONFIRM 事件并阻塞等待。
-        用户批准后执行，拒绝或超时则返回失败结果。
-        """
-        from src.tools.result import ToolResult
-
-        confirm_mode = settings.agent.tool_confirm_mode
-
-        # 判断是否需要确认
-        needs_confirm = False
-        if confirm_mode == "always":
-            needs_confirm = True
-        elif confirm_mode == "smart":
-            needs_confirm = self._should_confirm_tool(parsed.func_name, parsed.func_args)
-
-        if needs_confirm and wait_for_confirmation:
-            confirm_id = str(uuid.uuid4())
-            logger.info("工具 {} 需要用户确认 | confirm_id={}", parsed.func_name, confirm_id[:8])
-
-            if emit:
-                emit(AgentEvent(
-                    type=EventType.TOOL_CONFIRM,
-                    iteration=metrics.iterations,
-                    max_iterations=metrics.max_iterations,
-                    tool_name=parsed.func_name,
-                    tool_args=parsed.func_args,
-                    confirm_id=confirm_id,
-                ))
-
-            # 阻塞等待用户决策
-            approved = wait_for_confirmation(confirm_id)
-
-            if approved is None:
-                logger.info("工具确认超时或被停止 | {} | confirm_id={}",
-                           parsed.func_name, confirm_id[:8])
-                return ToolResult.fail("用户确认超时或对话已停止，已跳过执行")
-            elif not approved:
-                logger.info("用户拒绝执行工具 {} | confirm_id={}",
-                           parsed.func_name, confirm_id[:8])
-                return ToolResult.fail("用户已拒绝执行此操作")
-            else:
-                logger.info("用户批准执行工具 {} | confirm_id={}",
-                           parsed.func_name, confirm_id[:8])
-
-        return self._tools.execute(parsed.func_name, **parsed.func_args)
-
-    def _should_confirm_tool(self, tool_name: str, tool_args: dict) -> bool:
-        """根据工具的 should_confirm 方法判断是否需要确认。"""
-        try:
-            tool = self._tools.get(tool_name)
-            return tool.should_confirm(**tool_args)
-        except (KeyError, Exception):
-            return False
-
-    def _has_confirmable_tool(self, tool_calls) -> bool:
-        """检查 tool_calls 批次中是否有需要确认的工具。"""
-        for tc in tool_calls:
-            try:
-                func_name = tc["function"]["name"]
-                func_args_str = tc["function"]["arguments"]
-                func_args = json.loads(func_args_str) if func_args_str else {}
-                if self._should_confirm_tool(func_name, func_args):
-                    return True
-            except (json.JSONDecodeError, KeyError):
-                continue
-        return False
-
-    def _parse_and_emit_tool_call(
-        self, tc, metrics: RunMetrics, emit=None,
-        parallel_total: int = 0, parallel_index: int = 0,
-    ) -> Optional["_ParsedToolCall"]:
-        """解析工具调用参数，发送 TOOL_CALL 事件。
-
-        Returns:
-            解析成功返回 _ParsedToolCall，失败返回 None（已记录错误到 Memory）。
-        """
-        func_name = tc["function"]["name"]
-        func_args_str = tc["function"]["arguments"]
-        tool_call_id = tc["id"]
-
-        logger.info("调用工具: {} | 参数: {}", func_name, func_args_str)
-
-        try:
-            func_args = json.loads(func_args_str) if func_args_str else {}
-        except json.JSONDecodeError as e:
-            error_msg = f"参数解析失败: {e}"
-            logger.error("工具参数解析失败: {} | 原始参数: {}", e, func_args_str)
-            self._memory.add_tool_result(tool_call_id, func_name, error_msg)
-            metrics.record_tool_call(func_name, success=False, duration_ms=0, error=str(e))
-            self._loop_detector.record(func_name, func_args_str)
-            if emit:
-                emit(AgentEvent(
-                    type=EventType.TOOL_RESULT,
-                    tool_name=func_name,
-                    tool_args={},
-                    tool_result_preview=error_msg[:100],
-                    success=False,
-                    message=error_msg,
-                ))
-            return None
-
-        if emit:
-            emit(AgentEvent(
-                type=EventType.TOOL_CALL,
-                iteration=metrics.iterations,
-                max_iterations=metrics.max_iterations,
-                tool_name=func_name,
-                tool_args=func_args,
-                parallel_total=parallel_total,
-                parallel_index=parallel_index,
-            ))
-
-        return _ParsedToolCall(
-            func_name=func_name,
-            func_args=func_args,
-            func_args_str=func_args_str,
-            start_time=time.monotonic(),
-        )
-
-    def _record_tool_result(
-        self, tc, parsed: "_ParsedToolCall", result, duration_ms: int,
-        metrics: RunMetrics, emit=None,
-        parallel_total: int = 0, parallel_index: int = 0,
-    ) -> None:
-        """记录工具执行结果到 Memory、Metrics、LoopDetector，并发送事件。"""
-        tool_call_id = tc["id"]
-
-        metrics.record_tool_call(
-            parsed.func_name,
-            success=result.success,
-            duration_ms=duration_ms,
-            error=result.error,
-        )
-
-        self._loop_detector.record(parsed.func_name, parsed.func_args_str)
-
-        message_content = result.to_message()
-        truncated_info = " (已截断)" if result.truncated else ""
-        logger.info("工具 {} 执行完成 | 耗时: {:.0f}ms{} | 结果: {}",
-                    parsed.func_name, duration_ms, truncated_info, message_content[:200])
-
-        self._memory.add_tool_result(tool_call_id, parsed.func_name, message_content)
-
-        if emit:
-            emit(AgentEvent(
-                type=EventType.TOOL_RESULT,
-                iteration=metrics.iterations,
-                max_iterations=metrics.max_iterations,
-                tool_name=parsed.func_name,
-                tool_args=parsed.func_args,
-                tool_result_preview=message_content[:150],
-                duration_ms=duration_ms,
-                success=result.success,
-                parallel_total=parallel_total,
-                parallel_index=parallel_index,
-            ))
-
     def _force_final_answer(self, metrics: Optional[RunMetrics] = None) -> str:
         """强制 LLM 基于当前上下文给出最终回答（不再调用工具）。"""
         self._memory.add_user_message(
@@ -718,22 +498,6 @@ class ReActAgent(BaseAgent):
             metrics.record_llm_call(response.usage, call_type="force_answer")
         self._memory.add_assistant_message(response)
         return response.content or "抱歉，我无法得出结论。"
-
-
-@dataclass
-class _ParsedToolCall:
-    """工具调用解析结果（内部使用）。"""
-    func_name: str
-    func_args: dict
-    func_args_str: str
-    start_time: float
-
-
-@dataclass
-class _ToolExecResult:
-    """工具执行结果包装（内部使用）。"""
-    result: object  # ToolResult
-    duration_ms: int
 
 
 # Emoji Unicode 范围正则

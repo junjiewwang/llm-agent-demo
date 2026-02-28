@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class AgentStoppedError(Exception):
@@ -27,6 +27,13 @@ class EventType(str, Enum):
     ANSWERING = "answering"  # LLM 开始生成最终回答
     ERROR = "error"  # 执行出错
     MAX_ITERATIONS = "max_iterations"  # 达到最大迭代次数，强制总结
+    STATUS = "status"  # 状态提示（如上下文压缩进度）
+
+    # Plan-and-Execute 事件
+    PLAN_CREATED = "plan_created"  # 计划生成完成
+    STEP_START = "step_start"  # 开始执行某一步
+    STEP_DONE = "step_done"  # 某一步执行完成
+    REPLAN = "replan"  # 重新规划
 
 
 @dataclass(frozen=True)
@@ -49,3 +56,10 @@ class AgentEvent:
     parallel_total: int = 0  # >1 表示该工具调用是并发批次的一部分，值为批次总数
     parallel_index: int = 0  # 该工具在并发批次中的序号（从 1 开始）
     confirm_id: str = ""  # TOOL_CONFIRM 事件的唯一标识，用于前端回传确认结果
+
+    # Plan-and-Execute 字段
+    plan: Optional[Dict[str, Any]] = None  # PLAN_CREATED: 完整计划的序列化 dict
+    step_id: str = ""  # STEP_START / STEP_DONE: 当前步骤 ID
+    step_index: int = 0  # 当前步骤索引（从 0 开始）
+    total_steps: int = 0  # 计划总步骤数
+    step_status: str = ""  # STEP_DONE: 步骤执行状态（completed/failed/skipped）

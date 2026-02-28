@@ -25,9 +25,12 @@ Zone 架构（从稳定到动态）：
 """
 
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
+from src.config import settings
 from src.llm.base_client import Message, Role
+from src.memory.token_counter import TokenCounter
 from src.utils.logger import logger
 
 if TYPE_CHECKING:
@@ -63,6 +66,41 @@ def tool_environment(registry: "ToolRegistry") -> EnvironmentProvider:
     return provider
 
 
+@dataclass
+class ContextBuildStats:
+    """build() 后各 Zone 的 Token 占用统计。"""
+
+    # 各 Zone 实际 Token 使用量
+    system_tokens: int = 0
+    environment_tokens: int = 0
+    skill_tokens: int = 0
+    knowledge_tokens: int = 0
+    memory_tokens: int = 0
+    history_tokens: int = 0
+    total_tokens: int = 0
+    history_budget: int = 0  # History Zone 的动态预算
+
+    # Zone 预算上限（Sprint 3）
+    input_budget: int = 0
+    skill_budget: int = 0
+    knowledge_budget: int = 0
+    memory_budget: int = 0
+
+    # 是否发生截断（Sprint 3）
+    skill_truncated: bool = False
+    knowledge_truncated: bool = False
+    memory_truncated: bool = False
+    history_truncated: bool = False  # Phase 4 紧急截断
+
+    # Tools schema 预留
+    tools_token_reserve: int = 0
+
+    @property
+    def non_history_tokens(self) -> int:
+        """History 以外所有 Zone 的 Token 总和。"""
+        return self.total_tokens - self.history_tokens
+
+
 class ContextBuilder:
     """Zone 分层上下文构建器。
 
@@ -84,12 +122,14 @@ class ContextBuilder:
     def __init__(
         self,
         environment_providers: Optional[List[EnvironmentProvider]] = None,
+        model: str = "gpt-4o",
     ):
         """
         Args:
             environment_providers: 环境信息提供者列表。每个提供者返回 Dict[str, str]，
                 所有结果合并后作为 Environment Zone 内容。
                 默认包含 default_environment（当前时间）。
+            model: 模型名称，用于 TokenCounter 选择正确的编码器。
         """
         self._environment_providers: List[EnvironmentProvider] = (
             environment_providers if environment_providers is not None
@@ -98,6 +138,50 @@ class ContextBuilder:
         self._skill_messages: List[Message] = []
         self._knowledge_messages: List[Message] = []
         self._memory_messages: List[Message] = []
+        self._token_counter = TokenCounter(model)
+        self._last_build_stats: Optional[ContextBuildStats] = None
+        # 输入预算 = context_window - max_output_tokens
+        self._input_budget = max(settings.llm.context_window - settings.agent.max_tokens, 0)
+        # Tools schema 预留 token（由 set_tools_reserve() 设置）
+        self._tools_token_reserve: int = 0
+
+    @property
+    def last_build_stats(self) -> Optional[ContextBuildStats]:
+        """最近一次 build() 的各 Zone Token 统计。首次 build 前为 None。"""
+        return self._last_build_stats
+
+    @property
+    def effective_input_budget(self) -> int:
+        """扣除 tools schema 预留后的实际 messages 预算。
+
+        LLM API 的实际输入 = messages tokens + tools schema tokens。
+        ContextBuilder 只管 messages，因此 messages 预算需要扣除 tools 占用。
+        """
+        return max(self._input_budget - self._tools_token_reserve, 0)
+
+    def set_tools_reserve(self, tools_schema: Optional[List[Dict[str, Any]]]) -> "ContextBuilder":
+        """计算 tools schema 的 token 占用并预留。
+
+        每次 Agent run() 开始时调用一次（tools 列表在运行期间不变），
+        将 tools JSON Schema 的 token 数从 messages 预算中扣除，
+        确保 messages + tools 不超过模型的 input 限制。
+
+        Args:
+            tools_schema: OpenAI tools 格式的工具定义列表。None 表示不使用工具。
+
+        Returns:
+            self（支持链式调用）。
+        """
+        if not tools_schema:
+            self._tools_token_reserve = 0
+            return self
+
+        import json
+        schema_text = json.dumps(tools_schema, ensure_ascii=False)
+        self._tools_token_reserve = self._token_counter.count_text(schema_text)
+        logger.debug("Tools schema 预留: {} tokens（{} 个工具）",
+                     self._tools_token_reserve, len(tools_schema))
+        return self
 
     def set_skills(self, skills: List["Skill"]) -> "ContextBuilder":
         """设置当前激活的 Skills（按需注入领域专家 prompt）。
@@ -228,8 +312,74 @@ class ContextBuilder:
         self._memory_messages = []
         return self
 
-    def _build_environment_message(self) -> Optional[Message]:
+    def estimate_compression_needed(self, conversation_messages: List[Message]) -> Optional["CompressionEstimate"]:
+        """估算是否需要压缩 History Zone。
+
+        在正式 build 之前调用，用当前已设置的注入内容估算 non-history tokens，
+        再与 history tokens 比较，判断是否超过水位线。
+
+        注意：
+        - 估算时也应用 Zone budget cap，以获取截断后的真实 non-history tokens。
+        - 使用 effective_input_budget（已扣除 tools schema 预留），确保预算准确。
+
+        Args:
+            conversation_messages: ConversationMemory 中的消息列表（含 system prompt）。
+
+        Returns:
+            CompressionEstimate 如果需要压缩；None 如果不需要。
+        """
+        effective_budget = self.effective_input_budget
+        if effective_budget <= 0:
+            return None
+
+        # 拆分 system prompt 和 history
+        system_msgs = []
+        history_msgs = []
+        for msg in conversation_messages:
+            if msg.role == Role.SYSTEM:
+                system_msgs.append(msg)
+            else:
+                history_msgs.append(msg)
+
+        # 估算各 non-history Zone 的 token（应用 zone budget cap）
+        count = self._token_counter.count_messages
+        env_msg = self._build_environment_message()
+
+        skill_budget, knowledge_budget, memory_budget = self._compute_zone_budgets()
+        _, skill_tokens, _ = self._truncate_zone(self._skill_messages, skill_budget)
+        _, kb_tokens, _ = self._truncate_zone(self._knowledge_messages, knowledge_budget)
+        _, mem_tokens, _ = self._truncate_zone(self._memory_messages, memory_budget)
+
+        non_history_tokens = (
+            count(system_msgs)
+            + (count([env_msg]) if env_msg else 0)
+            + skill_tokens
+            + kb_tokens
+            + mem_tokens
+        )
+
+        history_budget_val = max(effective_budget - non_history_tokens, 0)
+        history_tokens = count(history_msgs)
+        threshold = settings.agent.compression_threshold
+
+        if history_budget_val > 0 and history_tokens > history_budget_val * threshold:
+            target_tokens = int(history_budget_val * settings.agent.compression_target_ratio)
+            return CompressionEstimate(
+                history_tokens=history_tokens,
+                history_budget=history_budget_val,
+                target_tokens=target_tokens,
+            )
+        return None
+
+    def _build_environment_message(self, *, compact: bool = False) -> Optional[Message]:
         """收集所有环境信息提供者的数据，构建 Environment Zone 消息。
+
+        Args:
+            compact: 紧凑模式。为 True 时只保留单行值（如当前时间），
+                跳过多行值（如工具列表）。用于 Plan-Execute 执行器的
+                上下文隔离——Function Calling 的 tools 参数已携带工具
+                schema，无需在 SYSTEM 消息中重复列出工具列表，避免
+                工具列表描述与步骤指令争夺 LLM 注意力。
 
         Returns:
             环境信息消息；无提供者或全部失败时返回 None。
@@ -259,20 +409,169 @@ class ContextBuilder:
         sections = []
         if inline_parts:
             sections.append(" | ".join(inline_parts))
-        sections.extend(block_parts)
+        if not compact:
+            sections.extend(block_parts)
+
+        if not sections:
+            return None
 
         return Message(
             role=Role.SYSTEM,
             content="\n\n".join(sections),
         )
 
-    def build(self, conversation_messages: List[Message]) -> List[Message]:
+    def _compute_zone_budgets(self) -> tuple:
+        """计算可截断 Zone 的预算上限。
+
+        使用 effective_input_budget（已扣除 tools schema 预留）作为基准。
+
+        Returns:
+            (skill_budget, knowledge_budget, memory_budget) 三元组，单位为 tokens。
+        """
+        budget = self.effective_input_budget
+        return (
+            int(budget * settings.agent.skill_zone_max_ratio),
+            int(budget * settings.agent.knowledge_zone_max_ratio),
+            int(budget * settings.agent.memory_zone_max_ratio),
+        )
+
+    def _truncate_zone(self, messages: List[Message], budget: int) -> tuple:
+        """按预算截断 Zone 消息。
+
+        截断策略：
+        - 如果 budget <= 0，直接返回空
+        - 逐条累加 token，超出预算时停止
+        - 对于单条大消息（如 KB 合并为一条），按文本行级截断
+
+        Args:
+            messages: Zone 的原始消息列表。
+            budget: Token 预算上限。
+
+        Returns:
+            (truncated_messages, actual_tokens, was_truncated) 三元组。
+        """
+        if not messages or budget <= 0:
+            return [], 0, False
+
+        count = self._token_counter.count_messages
+        total_tokens = count(messages)
+
+        # 未超预算，原样返回
+        if total_tokens <= budget:
+            return messages, total_tokens, False
+
+        # 多条消息：逐条累加，溢出时丢弃后续
+        if len(messages) > 1:
+            kept = []
+            accumulated = 0
+            for msg in messages:
+                msg_tokens = count([msg])
+                if accumulated + msg_tokens > budget:
+                    break
+                kept.append(msg)
+                accumulated = msg_tokens  # count_messages 包含全局开销，这里用累积值
+            # 重新精确计算
+            if kept:
+                actual = count(kept)
+                return kept, actual, True
+            return [], 0, True
+
+        # 单条大消息：按行截断内容
+        msg = messages[0]
+        content = msg.content or ""
+        lines = content.split("\n")
+
+        # 保留首行标题（如 "[知识库检索结果]"）+ 逐行累加
+        kept_lines = [lines[0]] if lines else []
+        for line in lines[1:]:
+            candidate = "\n".join(kept_lines + [line])
+            candidate_msg = [Message(role=msg.role, content=candidate)]
+            if count(candidate_msg) > budget:
+                break
+            kept_lines.append(line)
+
+        truncated_content = "\n".join(kept_lines)
+        if truncated_content != content:
+            truncated_content += "\n[... 已截断以适应上下文预算 ...]"
+        truncated_msg = Message(role=msg.role, content=truncated_content)
+        actual_tokens = count([truncated_msg])
+        return [truncated_msg], actual_tokens, True
+
+    def _emergency_truncate_history(
+        self,
+        system_msgs: List[Message],
+        env_msg: Optional[Message],
+        skill_msgs: List[Message],
+        kb_msgs: List[Message],
+        mem_msgs: List[Message],
+        history_msgs: List[Message],
+        budget: int,
+    ) -> tuple:
+        """紧急截断 History Zone，确保总 messages tokens ≤ budget。
+
+        从 history_msgs 头部（最早的消息）开始逐条移除，
+        直到重组后的 result 总 token 数在预算内。
+
+        注意：不修改 ConversationMemory 的实际数据，仅影响本次 build() 输出。
+
+        Args:
+            system_msgs: System Zone 消息。
+            env_msg: Environment Zone 消息（可能为 None）。
+            skill_msgs: Skill Zone 消息。
+            kb_msgs: Knowledge Zone 消息。
+            mem_msgs: Memory Zone 消息。
+            history_msgs: History Zone 消息（会被修改）。
+            budget: 有效 messages 预算。
+
+        Returns:
+            (result, remaining_history_msgs, history_tokens) 三元组。
+        """
+        count = self._token_counter.count_messages
+
+        # 构造非 history 部分
+        non_history = list(system_msgs)
+        if env_msg:
+            non_history.append(env_msg)
+        non_history.extend(skill_msgs)
+        non_history.extend(kb_msgs)
+        non_history.extend(mem_msgs)
+        non_history_tokens = count(non_history) if non_history else 0
+
+        # 计算 history 可用预算
+        history_budget = max(budget - non_history_tokens, 0)
+
+        # 从头部移除旧消息，直到 history 部分 ≤ history_budget
+        remaining = list(history_msgs)
+        while remaining and count(remaining) > history_budget:
+            remaining.pop(0)
+
+        result = non_history + remaining
+        history_tokens = count(remaining) if remaining else 0
+
+        logger.info("紧急截断完成 | 移除 {} 条旧 history | 剩余 {} 条 | history_tokens={}",
+                    len(history_msgs) - len(remaining), len(remaining), history_tokens)
+        return result, remaining, history_tokens
+
+    def build(
+        self,
+        conversation_messages: List[Message],
+        max_history: Optional[int] = None,
+        compact_env: bool = False,
+    ) -> List[Message]:
         """组装完整的 LLM 请求上下文。
 
         Zone 顺序：System → Environment → Skill → Inject(KB + Memory) → History(对话历史)
 
+        可截断 Zone（Skill/Knowledge/Memory）按预算上限截断，
+        多余空间自动归还给 History Zone。
+
         Args:
             conversation_messages: ConversationMemory 中的消息列表（含 system prompt）。
+            max_history: 可选，限制 History Zone 的最大消息条数（从末尾保留）。
+            compact_env: 紧凑环境模式。为 True 时 Environment Zone 只保留
+                单行值（如当前时间），跳过多行值（如工具列表）。
+                用于 Plan-Execute 执行器——tools 参数已携带完整
+                工具 schema，无需在 SYSTEM 消息中重复。
 
         Returns:
             组装后的完整 messages 列表，可直接传给 LLM.chat()。
@@ -286,24 +585,106 @@ class ContextBuilder:
             else:
                 history_msgs.append(msg)
 
-        # Zone 组装：System → Environment → Skill → KB → Memory → History
-        result = []
-        result.extend(system_msgs)                   # System Zone（稳定前缀）
+        # 如果指定了 max_history，按条数截断对话历史（保留最近的）
+        if max_history is not None and len(history_msgs) > max_history:
+            removed = len(history_msgs) - max_history
+            history_msgs = history_msgs[-max_history:]
+            logger.debug("ContextBuilder: 按条数截断历史消息，移除了 {} 条，保留 {} 条", removed, max_history)
 
-        env_msg = self._build_environment_message()   # Environment Zone
+        # Phase 1: 不可截断 Zone
+        result = []
+        result.extend(system_msgs)                    # System Zone（稳定前缀）
+
+        env_msg = self._build_environment_message(compact=compact_env)  # Environment Zone
         if env_msg:
             result.append(env_msg)
 
-        result.extend(self._skill_messages)           # Skill Zone（领域专家）
-        result.extend(self._knowledge_messages)       # Inject Zone - KB
-        result.extend(self._memory_messages)          # Inject Zone - Memory
-        result.extend(history_msgs)                   # History Zone（动态）
+        # Phase 2: 可截断 Zone — 按预算上限截断
+        skill_budget, knowledge_budget, memory_budget = self._compute_zone_budgets()
 
-        skill_count = len(self._skill_messages)
-        inject_count = len(self._knowledge_messages) + len(self._memory_messages)
+        skill_msgs, skill_tokens, skill_truncated = self._truncate_zone(self._skill_messages, skill_budget)
+        kb_msgs, kb_tokens, kb_truncated = self._truncate_zone(self._knowledge_messages, knowledge_budget)
+        mem_msgs, mem_tokens, mem_truncated = self._truncate_zone(self._memory_messages, memory_budget)
+
+        result.extend(skill_msgs)                     # Skill Zone（按预算截断）
+        result.extend(kb_msgs)                        # Knowledge Zone（按预算截断）
+        result.extend(mem_msgs)                       # Memory Zone（按预算截断）
+
+        # Phase 3: History Zone（剩余全部空间）
+        result.extend(history_msgs)
+
+        # 各 Zone Token 统计
+        count = self._token_counter.count_messages
+        system_tokens = count(system_msgs)
+        env_tokens = count([env_msg]) if env_msg else 0
+        history_tokens = count(history_msgs)
+
+        effective_budget = self.effective_input_budget
+        non_history_tokens = system_tokens + env_tokens + skill_tokens + kb_tokens + mem_tokens
+        history_budget_val = max(effective_budget - non_history_tokens, 0) if effective_budget > 0 else 0
+
+        # Phase 4: 最终安全检查 — 确保 total messages tokens ≤ effective_input_budget
+        # 当 tools schema 占用未被纳入预算、或 tiktoken 估算偏差时，这是最后的兜底
+        history_truncated = False
+        total_tokens = count(result)
+        if effective_budget > 0 and total_tokens > effective_budget:
+            overflow = total_tokens - effective_budget
+            logger.warning(
+                "上下文溢出 | total={} > budget={}, 溢出={} tokens, 紧急截断 History",
+                total_tokens, effective_budget, overflow,
+            )
+            result, history_msgs, history_tokens = self._emergency_truncate_history(
+                system_msgs, env_msg, skill_msgs, kb_msgs, mem_msgs,
+                history_msgs, effective_budget,
+            )
+            history_truncated = True
+            total_tokens = count(result)
+
+        if skill_truncated or kb_truncated or mem_truncated or history_truncated:
+            logger.info(
+                "Zone 截断 | skill: {}→{}/{} | kb: {}→{}/{} | mem: {}→{}/{} | history: {}",
+                "截断" if skill_truncated else "正常", skill_tokens, skill_budget,
+                "截断" if kb_truncated else "正常", kb_tokens, knowledge_budget,
+                "截断" if mem_truncated else "正常", mem_tokens, memory_budget,
+                "紧急截断" if history_truncated else "正常",
+            )
+
+        self._last_build_stats = ContextBuildStats(
+            system_tokens=system_tokens,
+            environment_tokens=env_tokens,
+            skill_tokens=skill_tokens,
+            knowledge_tokens=kb_tokens,
+            memory_tokens=mem_tokens,
+            history_tokens=history_tokens,
+            total_tokens=total_tokens,
+            history_budget=history_budget_val,
+            input_budget=self._input_budget,
+            skill_budget=skill_budget,
+            knowledge_budget=knowledge_budget,
+            memory_budget=memory_budget,
+            skill_truncated=skill_truncated,
+            knowledge_truncated=kb_truncated,
+            memory_truncated=mem_truncated,
+            history_truncated=history_truncated,
+            tools_token_reserve=self._tools_token_reserve,
+        )
+
         env_count = 1 if env_msg else 0
+        skill_count = len(skill_msgs)
+        inject_count = len(kb_msgs) + len(mem_msgs)
+
         logger.debug(
-            "ContextBuilder.build | system={} env={} skill={} inject={} history={} total={}",
+            "ContextBuilder.build | system={} env={} skill={} inject={} history={} total={} | tokens={} budget={}",
             len(system_msgs), env_count, skill_count, inject_count, len(history_msgs), len(result),
+            self._last_build_stats.total_tokens, history_budget_val,
         )
         return result
+
+
+@dataclass
+class CompressionEstimate:
+    """压缩估算结果，由 estimate_compression_needed() 返回。"""
+
+    history_tokens: int  # 当前 History Zone 的 token 数
+    history_budget: int  # History Zone 的动态预算
+    target_tokens: int  # 压缩后的目标 token 数

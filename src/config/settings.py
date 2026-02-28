@@ -15,8 +15,9 @@ class LLMSettings(BaseSettings):
     context_window: int = 0  # 0 = 自动根据模型名推导
 
     # 内置模型容量映射表（可扩展）
-    # 注意：这里配置的是 Input Context Window，不含 Output
-    MODEL_CONTEXT_WINDOWS: dict = {
+    # context_window = 模型总容量（input + output），单位 token
+    # 匹配优先级：精确匹配 → 模糊匹配（key in model_name）→ 前缀族匹配 → 兜底
+    MODEL_CONTEXT_WINDOWS: dict[str, int] = {
         # OpenAI
         "gpt-4o": 128_000,
         "gpt-4-turbo": 128_000,
@@ -27,30 +28,64 @@ class LLMSettings(BaseSettings):
         "claude-3-opus-20240229": 200_000,
         "claude-3-sonnet-20240229": 200_000,
         "claude-3-haiku-20240307": 200_000,
+        "claude-3.5-sonnet": 200_000,
+        "claude-4": 200_000,
         # DeepSeek
         "deepseek-chat": 64_000,
         "deepseek-coder": 64_000,
+        "deepseek-v3": 128_000,
+        "deepseek-r1": 128_000,
+        "deepseek-reasoner": 128_000,
+        # Qwen
+        "qwen-turbo": 131_072,
+        "qwen-plus": 131_072,
+        "qwen-max": 131_072,
         # Local / Others
         "llama3-70b-8192": 8_192,
         "mixtral-8x7b-32768": 32_768,
+    }
+
+    # 模型族前缀兜底映射：当精确匹配和模糊匹配都失败时，按前缀推导
+    # 按前缀长度降序排列，确保 "deepseek-v3" 优先于 "deepseek"
+    _MODEL_FAMILY_DEFAULTS: dict[str, int] = {
+        "gpt-4o": 128_000,
+        "gpt-4": 8_192,
+        "gpt-3.5": 16_385,
+        "claude-3": 200_000,
+        "claude-4": 200_000,
+        "deepseek-v3": 128_000,
+        "deepseek-r1": 128_000,
+        "deepseek": 64_000,
+        "qwen": 131_072,
+        "llama": 8_192,
     }
 
     def model_post_init(self, __context):
         """初始化后自动推导 context_window。"""
         super().model_post_init(__context)
         if self.context_window == 0:
-            # 1. 精确匹配
-            if self.model in self.MODEL_CONTEXT_WINDOWS:
-                self.context_window = self.MODEL_CONTEXT_WINDOWS[self.model]
-            # 2. 模糊匹配（如 gpt-4o-2024-05-13 -> gpt-4o）
-            else:
-                for key, val in self.MODEL_CONTEXT_WINDOWS.items():
-                    if key in self.model:
-                        self.context_window = val
-                        break
-                else:
-                    # 3. 默认兜底（保守值）
-                    self.context_window = 8_192
+            self.context_window = self._resolve_context_window()
+
+    def _resolve_context_window(self) -> int:
+        """三级匹配推导 context_window。"""
+        model = self.model
+
+        # 1. 精确匹配
+        if model in self.MODEL_CONTEXT_WINDOWS:
+            return self.MODEL_CONTEXT_WINDOWS[model]
+
+        # 2. 模糊匹配（映射表 key 是 model 的子串，如 gpt-4o-2024-05-13 匹配 gpt-4o）
+        for key, val in self.MODEL_CONTEXT_WINDOWS.items():
+            if key in model:
+                return val
+
+        # 3. 前缀族匹配（model 以族前缀开头，如 deepseek-v3.2 匹配 deepseek-v3）
+        for prefix, val in self._MODEL_FAMILY_DEFAULTS.items():
+            if model.startswith(prefix):
+                return val
+
+        # 4. 兜底
+        return 8_192
 
     model_config = SettingsConfigDict(
         env_prefix="LLM_",
@@ -71,6 +106,7 @@ class AgentSettings(BaseSettings):
 
     max_iterations: int = 10
     temperature: float = 0.7
+    step_temperature: float = 0.3  # Plan-Execute 步骤执行的独立 temperature（低温 → 工具选择更确定性）
     max_tokens: int = 4096
     kb_relevance_threshold: float = 0.7
     memory_relevance_threshold: float = 0.7
@@ -78,9 +114,23 @@ class AgentSettings(BaseSettings):
 
     # ── 3.0 演进开关（默认关闭，不影响现有行为） ──
     message_usage_enabled: bool = True  # 前端展示消息级 token 消耗
+    plan_execute_enabled: bool = False  # Plan-and-Execute 模式（复杂任务自动分解）
     policy_enabled: bool = False  # 工具策略重排（Sprint 2）
     memory_governor_enabled: bool = False  # 长期记忆治理（Sprint 3）
     env_adapter_enabled: bool = False  # 环境适配器（Sprint 3）
+
+    # ── 上下文容量管理 ──
+    compression_threshold: float = 0.8  # History Zone 水位线（占 history_budget 的比例），超过则触发压缩
+    compression_target_ratio: float = 0.6  # 压缩后目标占比（压缩到 history_budget * 此值）
+
+    # ── Zone 预算上限（占 input_budget 的比例）──
+    # 可截断 Zone 的弹性上限，实际用量低于上限时不截断，多余空间归 History Zone
+    skill_zone_max_ratio: float = 0.15  # Skill Zone 最多占 input_budget 的 15%
+    knowledge_zone_max_ratio: float = 0.15  # Knowledge Zone 最多占 input_budget 的 15%
+    memory_zone_max_ratio: float = 0.05  # Memory Zone 最多占 input_budget 的 5%
+
+    # ── Skill 匹配配置 ──
+    skill_min_match_score: float = 0.15  # Skill 关键词匹配的最低分数阈值（低于此值不激活）
 
     # ── Memory Governor 配置 ──
     memory_governor_interval: int = 300  # 治理周期（秒），默认 5 分钟
@@ -149,28 +199,24 @@ class DevOpsSettings(BaseSettings):
 
     环境变量前缀: DEVOPS_
     - DEVOPS_KUBECTL_ENABLED: 是否启用 kubectl 工具（默认 False）
-    - DEVOPS_KUBECTL_READ_ONLY: kubectl 只读模式（默认 True）
     - DEVOPS_KUBECTL_ALLOWED_NAMESPACES: 允许的 namespace（逗号分隔，空=全部）
     - DEVOPS_KUBECTL_TIMEOUT: kubectl 命令超时（秒，默认 30）
     - DEVOPS_DOCKER_ENABLED: 是否启用 docker 工具（默认 False）
-    - DEVOPS_DOCKER_READ_ONLY: docker 只读模式（默认 True）
     - DEVOPS_DOCKER_TIMEOUT: docker 命令超时（秒，默认 30）
     - DEVOPS_CURL_ENABLED: 是否启用 curl HTTP 请求工具（默认 False）
-    - DEVOPS_CURL_READ_ONLY: curl 只读模式（默认 True，仅 GET/HEAD/OPTIONS）
     - DEVOPS_CURL_TIMEOUT: 请求超时（秒，默认 30）
     - DEVOPS_CURL_ALLOWED_HOSTS: Host 白名单（逗号分隔，空=不限制）
     - DEVOPS_CURL_MAX_RESPONSE_BYTES: 最大响应大小（字节，默认 1MB）
+
+    安全保障：写操作和危险操作通过 tool_confirm_mode（Human-in-the-loop）确认机制控制。
     """
 
     kubectl_enabled: bool = False
-    kubectl_read_only: bool = True
     kubectl_allowed_namespaces: str = ""
     kubectl_timeout: int = 30
     docker_enabled: bool = False
-    docker_read_only: bool = True
     docker_timeout: int = 30
     curl_enabled: bool = False
-    curl_read_only: bool = True
     curl_timeout: int = 30
     curl_allowed_hosts: str = ""
     curl_max_response_bytes: int = 1_048_576
@@ -265,6 +311,20 @@ class Settings:
         self.otel = OtelSettings()
         self.skills = SkillSettings()
         self.auth = AuthSettings()
+        self._validate_cross_config()
+
+    def _validate_cross_config(self):
+        """跨配置组的一致性校验。"""
+        ctx = self.llm.context_window
+        out = self.agent.max_tokens
+        if ctx > 0 and out >= ctx:
+            import warnings
+            warnings.warn(
+                f"AGENT_MAX_TOKENS({out}) >= LLM_CONTEXT_WINDOW({ctx})，"
+                f"input_budget 将为 0。请检查模型映射表或 .env 配置。"
+                f"当前模型: {self.llm.model}",
+                stacklevel=2,
+            )
 
 
 settings = Settings()
