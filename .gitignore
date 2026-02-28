@@ -28,6 +28,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
 
 # Agent data (vector store etc.)
 .agent_data/
@@ -38,3 +39,6 @@ frontend/dist/
 
 # Codebuddy
 .codebuddy
+
+# 截图图片
+*.png
