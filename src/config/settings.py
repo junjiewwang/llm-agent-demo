@@ -40,6 +40,11 @@ class LLMSettings(BaseSettings):
         "qwen-turbo": 131_072,
         "qwen-plus": 131_072,
         "qwen-max": 131_072,
+        # Zhipu GLM
+        "glm-5": 200_000,
+        "glm-4-plus": 128_000,
+        "glm-4": 128_000,
+        "glm-4-flash": 128_000,
         # Local / Others
         "llama3-70b-8192": 8_192,
         "mixtral-8x7b-32768": 32_768,
@@ -56,6 +61,9 @@ class LLMSettings(BaseSettings):
         "deepseek-v3": 128_000,
         "deepseek-r1": 128_000,
         "deepseek": 64_000,
+        "glm-5": 200_000,
+        "glm-4": 128_000,
+        "glm": 128_000,
         "qwen": 131_072,
         "llama": 8_192,
     }
