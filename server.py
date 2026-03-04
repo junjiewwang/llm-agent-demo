@@ -7,8 +7,12 @@
 """
 
 import argparse
+import warnings
 
 import uvicorn
+
+# ChromaDB 在 Python 3.11+ 退出时的信号量泄漏警告，不影响功能
+warnings.filterwarnings("ignore", message="resource_tracker.*semaphore", category=UserWarning)
 
 from src.api.app import create_app
 
