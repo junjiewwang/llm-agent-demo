@@ -11,60 +11,38 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useChatStore } from '../../stores/chatStore'
-import type { PlanProgress } from '../../stores/chatStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import MessageBubble from './MessageBubble'
 import ThinkingPanel from './ThinkingPanel'
 import InputBox from './InputBox'
 
-/** Plan 执行进度条 */
-function PlanProgressBar({ progress }: { progress: PlanProgress }) {
-  const { totalSteps, currentStep, currentDescription, completedSteps, steps } = progress
+/** Plan 执行状态提示条（轻量内联，与 ThinkingPanel 风格统一） */
+function PlanStatusBar({ progress }: { progress: { totalSteps: number; currentStep: number; currentDescription: string; completedSteps: number } }) {
+  const { totalSteps, currentStep, currentDescription, completedSteps } = progress
   const pct = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-2">
-      <div className="px-3 py-2.5 rounded-lg bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200/60 dark:border-indigo-800/40">
-        {/* 标题行 */}
-        <div className="flex items-center justify-between mb-1.5">
-          <span className="text-xs font-medium text-indigo-700 dark:text-indigo-300">
-            📋 计划执行中 · 步骤 {currentStep}/{totalSteps}
+    <div className="max-w-6xl mx-auto px-4 mb-1">
+      <div className="max-w-[80%]">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-gray-50/80 dark:bg-gray-800/40 border border-gray-200/50 dark:border-gray-700/40 text-[11px] text-gray-500 dark:text-gray-400">
+          <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse flex-shrink-0" />
+          <span className="font-medium text-gray-600 dark:text-gray-300">
+            步骤 {currentStep}/{totalSteps}
           </span>
-          <span className="text-xs text-indigo-500 dark:text-indigo-400">
-            {completedSteps} 步完成 ({pct}%)
-          </span>
+          {currentDescription && (
+            <>
+              <span className="text-gray-300 dark:text-gray-600">·</span>
+              <span className="truncate">{currentDescription}</span>
+            </>
+          )}
+          <span className="ml-auto flex-shrink-0 text-gray-400 dark:text-gray-500 tabular-nums">{pct}%</span>
         </div>
-        {/* 进度条 */}
-        <div className="w-full h-1.5 bg-indigo-100 dark:bg-indigo-900/50 rounded-full overflow-hidden mb-1.5">
+        {/* 2px 微型进度条 */}
+        <div className="h-[2px] bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden -mt-[1px] mx-1">
           <div
-            className="h-full bg-indigo-500 dark:bg-indigo-400 rounded-full transition-all duration-500 ease-out"
+            className="h-full bg-emerald-500 rounded-full transition-all duration-500 ease-out"
             style={{ width: `${pct}%` }}
           />
-        </div>
-        {/* 当前步骤描述 */}
-        {currentDescription && (
-          <div className="text-xs text-indigo-600/80 dark:text-indigo-400/80 truncate">
-            ▶ {currentDescription}
-          </div>
-        )}
-        {/* 步骤指示器 */}
-        <div className="flex gap-1 mt-1.5">
-          {steps.map((step, i) => {
-            const colors: Record<string, string> = {
-              completed: 'bg-green-500',
-              running: 'bg-indigo-500 animate-pulse',
-              failed: 'bg-red-500',
-              skipped: 'bg-gray-300 dark:bg-gray-600',
-              pending: 'bg-gray-200 dark:bg-gray-700',
-            }
-            return (
-              <div
-                key={step.id}
-                className={`h-1 flex-1 rounded-full ${colors[step.status] || colors.pending}`}
-                title={`步骤 ${i + 1}: ${step.description}`}
-              />
-            )
-          })}
         </div>
       </div>
     </div>
@@ -235,9 +213,9 @@ export default function ChatView() {
               // 流式进行中：在底部实时展示思考过程（默认展开）
               Footer: () => (
                 <>
-                  {/* Plan 模式进度条 */}
+                  {/* Plan 模式状态提示条 */}
                   {isStreaming && planProgress && (
-                    <PlanProgressBar progress={planProgress} />
+                    <PlanStatusBar progress={planProgress} />
                   )}
                   {/* 非 Plan 模式：状态提示条（如上下文压缩进度） */}
                   {!planProgress && statusMessage && (

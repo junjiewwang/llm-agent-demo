@@ -4,7 +4,7 @@ display_name: K8s 资源分析专家
 description: Kubernetes 集群资源查看与分析，包括多 namespace 资源概览、资源用量分析等
 priority: 20
 required_tools:
-  - kubectl
+  - execute_command
 trigger_patterns:
   - 资源
   - 概览

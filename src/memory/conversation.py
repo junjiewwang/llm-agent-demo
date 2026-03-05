@@ -222,10 +222,16 @@ class ConversationMemory:
         logger.debug("对话记忆已恢复，消息数={}", len(self._messages))
 
     def _smart_truncate(self) -> None:
-        """消息数量硬上限保护。
+        """消息数量硬上限保护（工具调用配对感知）。
 
         仅保护消息条数不爆炸（max_messages），Token 级别的容量管理
         由上层 ContextBuilder.estimate_compression_needed() + compress() 负责。
+
+        关键机制：截断时保证 assistant(tool_calls) → tool(result) 消息组的
+        原子性，不会在组的中间切断。如果朴素截断边界恰好落在一组
+        tool result 消息中间（前面的 assistant 被切掉了），则向后移动
+        截断点，跳过这些孤立的 tool 消息，确保截断后的首条消息不是
+        没有对应 assistant 的 tool 消息。
 
         注意：当存在活跃的 Scratchpad 快照时，截断会同步调整快照位置，
         确保 messages_from(snapshot_pos) 始终指向正确的消息范围。
@@ -234,8 +240,19 @@ class ConversationMemory:
         truncatable = self._messages[self._system_prompt_count:]
 
         if len(truncatable) > self._max_messages:
-            removed = len(truncatable) - self._max_messages
-            truncatable = truncatable[-self._max_messages:]
+            # 朴素截断点
+            naive_cut = len(truncatable) - self._max_messages
+            # 向后调整截断点，跳过孤立的 tool 消息
+            cut = naive_cut
+            while cut < len(truncatable) and truncatable[cut].role == Role.TOOL:
+                cut += 1
+            if cut != naive_cut:
+                logger.debug(
+                    "截断边界调整：跳过 {} 条孤立 tool 消息（{} -> {}）",
+                    cut - naive_cut, naive_cut, cut,
+                )
+            removed = cut
+            truncatable = truncatable[cut:]
             self._messages = protected + truncatable
             logger.debug("消息数量截断，移除了 {} 条旧消息", removed)
 

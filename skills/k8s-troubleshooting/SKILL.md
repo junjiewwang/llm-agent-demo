@@ -4,7 +4,7 @@ display_name: K8s 故障排查专家
 description: Kubernetes 集群故障排查，包括 Pod 异常、服务不可达、资源不足等问题的系统化诊断
 priority: 10
 required_tools:
-  - kubectl
+  - execute_command
 trigger_patterns:
   - 排查
   - 故障

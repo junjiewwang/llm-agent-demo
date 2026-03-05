@@ -1,4 +1,4 @@
-"""循环检测器 - 识别 Agent 无限重试和任务偏离的工具调用模式。
+"""循环检测器 - 识别 Agent 无限重试、任务偏离和过度探索的工具调用模式。
 
 解决的问题：
 当 LLM 陷入"调用同一工具 → 相同参数 → 相同结果 → 再次调用"的死循环时，
@@ -7,13 +7,15 @@
 循环检测器通过记录最近的工具调用模式，在连续重复出现时提前发出预警，
 让 Agent 主动插入引导 prompt 告知 LLM 停止重试并换种方式回答。
 
-检测策略（三层）：
+检测策略（四层）：
 - L1 精确匹配：将每次工具调用转为 fingerprint（tool_name + 参数摘要），
   如果最近 N 次调用中出现连续相同的 fingerprint，判定为循环。
 - L2 语义匹配：同一工具连续返回空/无效结果达到阈值时，
   即使参数不同也判定为语义级循环（解决"换参数重试同一工具"的盲区）。
 - L3 任务偏离检测：当连续 N 次工具调用与步骤目标所需的工具不匹配时，
   判定为注意力漂移（解决"LLM 被上下文污染导致调用无关工具"的问题）。
+- L4 过度探索检测：当工具调用总次数超过阈值时，提醒 LLM 评估已有信息
+  是否足以回答用户问题，避免无限深挖（解决"每次调用都成功但不停止"的问题）。
 """
 
 import hashlib
@@ -31,6 +33,8 @@ DEFAULT_WINDOW_SIZE = 10
 DEFAULT_EMPTY_RESULT_THRESHOLD = 3
 # 连续调用无关工具达到此次数即判定为任务偏离
 DEFAULT_DRIFT_THRESHOLD = 2
+# L4: 工具调用总次数达到此值时触发过度探索提醒（温和引导，非强制停止）
+DEFAULT_OVER_EXPLORE_THRESHOLD = 3
 
 # 空结果的判定模式：去除空白后为空、或仅包含"无输出"等提示
 _EMPTY_PATTERNS = frozenset({
@@ -48,7 +52,7 @@ def _is_empty_result(result: str) -> bool:
 
 @dataclass
 class LoopDetector:
-    """工具调用循环检测器（三层检测）。
+    """工具调用循环检测器（四层检测）。
 
     用法：
         detector = LoopDetector()
@@ -62,16 +66,18 @@ class LoopDetector:
         if detector.is_looping():
             # 插入引导 prompt 让 LLM 换种方式回答
 
-    三层检测策略：
+    四层检测策略：
     - L1 精确匹配：连续 N 次完全相同的 fingerprint（tool_name + 参数 MD5）
     - L2 语义匹配：同一工具连续 N 次返回空/无效结果（参数可不同）
     - L3 任务偏离：连续 N 次调用的工具不在预期工具列表中
+    - L4 过度探索：工具调用总次数超过阈值时温和提醒
     """
 
     repeat_threshold: int = DEFAULT_REPEAT_THRESHOLD
     window_size: int = DEFAULT_WINDOW_SIZE
     empty_result_threshold: int = DEFAULT_EMPTY_RESULT_THRESHOLD
     drift_threshold: int = DEFAULT_DRIFT_THRESHOLD
+    over_explore_threshold: int = DEFAULT_OVER_EXPLORE_THRESHOLD
     _fingerprints: List[str] = field(default_factory=list)
     # L2 语义检测：tool_name → 连续空结果计数
     _empty_result_streaks: Dict[str, int] = field(default_factory=dict)
@@ -82,6 +88,9 @@ class LoopDetector:
     _consecutive_drift_count: int = field(default=0)
     _drift_detected: bool = field(default=False)
     _drift_tools: List[str] = field(default_factory=list)
+    # L4 过度探索检测
+    _total_calls: int = field(default=0)
+    _over_explore_reminded: bool = field(default=False)
 
     def set_expected_tools(self, tool_names: Optional[List[str]]) -> None:
         """设置当前步骤的预期工具列表（用于 L3 任务偏离检测）。
@@ -98,9 +107,10 @@ class LoopDetector:
         self._drift_tools = []
 
     def record(self, tool_name: str, arguments: str) -> None:
-        """记录一次工具调用（L1 精确匹配 + L3 偏离检测）。"""
+        """记录一次工具调用（L1 精确匹配 + L3 偏离检测 + L4 计数）。"""
         fp = self._make_fingerprint(tool_name, arguments)
         self._fingerprints.append(fp)
+        self._total_calls += 1
         # 只保留最近的 window_size 条
         if len(self._fingerprints) > self.window_size:
             self._fingerprints = self._fingerprints[-self.window_size:]
@@ -146,8 +156,13 @@ class LoopDetector:
                 self._semantic_loop_tool = None
 
     def is_looping(self) -> bool:
-        """检测是否进入循环模式（L1/L2/L3 任一触发即判定）。"""
-        return self._is_exact_looping() or self._is_semantic_looping() or self._is_drifting()
+        """检测是否进入循环模式（L1/L2/L3/L4 任一触发即判定）。"""
+        return (
+            self._is_exact_looping()
+            or self._is_semantic_looping()
+            or self._is_drifting()
+            or self._is_over_exploring()
+        )
 
     def _is_exact_looping(self) -> bool:
         """L1 精确匹配：最近连续 repeat_threshold 次调用的 fingerprint 相同。"""
@@ -171,6 +186,18 @@ class LoopDetector:
     def _is_drifting(self) -> bool:
         """L3 任务偏离检测：连续调用非预期工具达到阈值。"""
         return self._drift_detected
+
+    def _is_over_exploring(self) -> bool:
+        """L4 过度探索检测：工具调用总次数超过阈值且尚未提醒过。"""
+        if self._over_explore_reminded:
+            return False
+        if self._total_calls >= self.over_explore_threshold:
+            logger.warning(
+                "检测到过度探索 | 工具调用已达 {} 次（阈值 {}）",
+                self._total_calls, self.over_explore_threshold,
+            )
+            return True
+        return False
 
     def get_loop_summary(self) -> Optional[str]:
         """如果处于循环中，返回循环摘要信息供 Agent 使用。"""
@@ -220,6 +247,16 @@ class LoopDetector:
                 f"3. 如果确实无法解决，请如实告诉用户"
             )
 
+        # L4 过度探索提醒（优先级最低，温和引导）
+        if self._is_over_exploring():
+            self._over_explore_reminded = True
+            return (
+                f"⚠️ 你已经调用了 {self._total_calls} 次工具。"
+                f"请立即评估：已有的工具返回结果是否足以回答用户的核心问题？\n"
+                f"- 如果足够，请立即基于已有结果给出回答，不要再调用工具\n"
+                f"- 如果确实还缺少关键信息，可以继续，但请确保下一次调用是必要的"
+            )
+
         return None
 
     def reset(self) -> None:
@@ -231,6 +268,8 @@ class LoopDetector:
         self._consecutive_drift_count = 0
         self._drift_detected = False
         self._drift_tools = []
+        self._total_calls = 0
+        self._over_explore_reminded = False
 
     @staticmethod
     def _make_fingerprint(tool_name: str, arguments: str) -> str:

@@ -202,35 +202,31 @@ class FilesystemSettings(BaseSettings):
     )
 
 
-class DevOpsSettings(BaseSettings):
-    """DevOps 工具配置。
+class CommandSettings(BaseSettings):
+    """统一命令执行工具配置。
 
-    环境变量前缀: DEVOPS_
-    - DEVOPS_KUBECTL_ENABLED: 是否启用 kubectl 工具（默认 False）
-    - DEVOPS_KUBECTL_ALLOWED_NAMESPACES: 允许的 namespace（逗号分隔，空=全部）
-    - DEVOPS_KUBECTL_TIMEOUT: kubectl 命令超时（秒，默认 30）
-    - DEVOPS_DOCKER_ENABLED: 是否启用 docker 工具（默认 False）
-    - DEVOPS_DOCKER_TIMEOUT: docker 命令超时（秒，默认 30）
-    - DEVOPS_CURL_ENABLED: 是否启用 curl HTTP 请求工具（默认 False）
-    - DEVOPS_CURL_TIMEOUT: 请求超时（秒，默认 30）
-    - DEVOPS_CURL_ALLOWED_HOSTS: Host 白名单（逗号分隔，空=不限制）
-    - DEVOPS_CURL_MAX_RESPONSE_BYTES: 最大响应大小（字节，默认 1MB）
+    环境变量前缀: COMMAND_
+    - COMMAND_ENABLED: 总开关（默认 False）
+    - COMMAND_ALLOWED_BINARIES: 允许的二进制白名单（逗号分隔，默认 kubectl,docker,curl）
+    - COMMAND_TIMEOUT: 命令超时（秒，默认 30）
+    - COMMAND_MAX_OUTPUT_CHARS: 输出截断阈值（字符，默认 5000）
+    - COMMAND_KUBECTL_ALLOWED_NAMESPACES: kubectl namespace 白名单（逗号分隔，空=全部）
+    - COMMAND_CURL_ALLOWED_HOSTS: curl Host 白名单（逗号分隔，空=不限制）
+    - COMMAND_CONFIRM_WRITES: 写操作是否需要用户确认（默认 True）
 
     安全保障：写操作和危险操作通过 tool_confirm_mode（Human-in-the-loop）确认机制控制。
     """
 
-    kubectl_enabled: bool = False
+    enabled: bool = False
+    allowed_binaries: str = "kubectl,docker,curl"
+    timeout: int = 30
+    max_output_chars: int = 5000
     kubectl_allowed_namespaces: str = ""
-    kubectl_timeout: int = 30
-    docker_enabled: bool = False
-    docker_timeout: int = 30
-    curl_enabled: bool = False
-    curl_timeout: int = 30
     curl_allowed_hosts: str = ""
-    curl_max_response_bytes: int = 1_048_576
+    confirm_writes: bool = True
 
     model_config = SettingsConfigDict(
-        env_prefix="DEVOPS_",
+        env_prefix="COMMAND_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
@@ -315,7 +311,7 @@ class Settings:
         self.agent = AgentSettings()
         self.search = SearchSettings()
         self.filesystem = FilesystemSettings()
-        self.devops = DevOpsSettings()
+        self.command = CommandSettings()
         self.otel = OtelSettings()
         self.skills = SkillSettings()
         self.auth = AuthSettings()
