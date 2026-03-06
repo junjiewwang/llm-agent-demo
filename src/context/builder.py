@@ -95,10 +95,73 @@ class ContextBuildStats:
     # Tools schema 预留
     tools_token_reserve: int = 0
 
+    # Archive Zone（Sprint 2: 对话归档检索）
+    archive_tokens: int = 0
+    archive_budget: int = 0
+    archive_truncated: bool = False
+
+    # 工具结果精简统计
+    tool_results_compacted: int = 0  # 被精简的工具返回消息数
+
+    # Session Summary（Sprint 3: 会话级概要）
+    session_summary_tokens: int = 0
+
     @property
     def non_history_tokens(self) -> int:
         """History 以外所有 Zone 的 Token 总和。"""
         return self.total_tokens - self.history_tokens
+
+
+def _summarize_json_result(tool_name: str, data: Any) -> str:
+    """将 JSON 格式的工具返回提炼为一行摘要。
+
+    覆盖常见数据结构：
+    - list: "[工具 X 返回 N 条结果]" + 首条样例的 key
+    - dict with list value: 找到主列表字段，报告条数
+    - dict with status/result: 提取状态和关键字段
+    - 其他: 报告 key 列表
+
+    Args:
+        tool_name: 工具名称。
+        data: 已解析的 JSON 对象。
+
+    Returns:
+        精简摘要字符串。
+    """
+    if isinstance(data, list):
+        count = len(data)
+        if count == 0:
+            return f"[工具 {tool_name} 返回空列表]"
+        # 提取首条记录的 key 作为 schema 提示
+        sample_keys = ""
+        if isinstance(data[0], dict):
+            keys = list(data[0].keys())[:5]
+            sample_keys = f"，字段: {', '.join(keys)}"
+        return f"[工具 {tool_name} 返回 {count} 条结果{sample_keys}]"
+
+    if isinstance(data, dict):
+        # 检查是否包含 status/error 字段
+        status = data.get("status") or data.get("state") or data.get("code")
+        if status is not None:
+            msg = data.get("message") or data.get("msg") or data.get("detail") or ""
+            summary = f"[工具 {tool_name} 返回 status={status}"
+            if msg:
+                summary += f", message={str(msg)[:100]}"
+            summary += "]"
+            return summary
+
+        # 检查是否有主列表字段（如 data, items, results, records）
+        for list_key in ("data", "items", "results", "records", "list"):
+            if list_key in data and isinstance(data[list_key], list):
+                count = len(data[list_key])
+                return f"[工具 {tool_name} 返回 {count} 条 {list_key}]"
+
+        # 兜底：列出 top-level keys
+        keys = list(data.keys())[:8]
+        return f"[工具 {tool_name} 返回 dict，keys: {', '.join(keys)}]"
+
+    # 标量值
+    return f"[工具 {tool_name} 返回: {str(data)[:200]}]"
 
 
 class ContextBuilder:
@@ -138,6 +201,8 @@ class ContextBuilder:
         self._skill_messages: List[Message] = []
         self._knowledge_messages: List[Message] = []
         self._memory_messages: List[Message] = []
+        self._archive_messages: List[Message] = []
+        self._session_summary: Optional[Message] = None
         self._token_counter = TokenCounter(model)
         self._last_build_stats: Optional[ContextBuildStats] = None
         # 输入预算 = context_window - max_output_tokens
@@ -305,11 +370,67 @@ class ContextBuilder:
         logger.debug("ContextBuilder: 设置 {} 条长期记忆（去重后）", len(unique_results))
         return self
 
+    def set_archive(self, results: List[dict], relevance_threshold: float = 0.8) -> "ContextBuilder":
+        """设置对话归档检索结果（临时注入，不持久化）。
+
+        Args:
+            results: ConversationArchive.search() 返回的结果列表，
+                每项含 'text', 'metadata', 'distance'。
+            relevance_threshold: 相关度阈值（cosine distance），低于此值才认为相关。
+        """
+        if not results:
+            self._archive_messages = []
+            return self
+
+        relevant = [r for r in results if r.get("distance", 1.0) < relevance_threshold]
+        if not relevant:
+            self._archive_messages = []
+            return self
+
+        archive_text = "\n\n".join(
+            f"[历史交互 {i + 1}]\n{r['text']}"
+            for i, r in enumerate(relevant)
+        )
+        self._archive_messages = [
+            Message(
+                role=Role.SYSTEM,
+                content=f"[相关历史对话]\n{archive_text}",
+            )
+        ]
+        logger.debug("ContextBuilder: 设置 {} 条对话归档片段", len(relevant))
+        return self
+
     def clear_injections(self) -> "ContextBuilder":
-        """清除所有临时注入（Skills + KB + 长期记忆），用于新一轮对话。"""
+        """清除所有临时注入（Skills + KB + 长期记忆 + 归档），用于新一轮对话。
+
+        注意：Session Summary 不清除——它跨越整个对话生命周期，
+        由 set_session_summary() 显式更新。
+        """
         self._skill_messages = []
         self._knowledge_messages = []
         self._memory_messages = []
+        self._archive_messages = []
+        return self
+
+    def set_session_summary(self, summary: str) -> "ContextBuilder":
+        """设置当前会话概要（注入 History Zone 头部）。
+
+        Session Summary 是 History Zone 的全局概要，逻辑上属于 History，
+        不作为独立 Zone 管理预算。token 占用很小（~200），从 History Zone
+        预算中扣除。
+
+        Args:
+            summary: 会话概要文本。为空时清除。
+        """
+        if not summary or not summary.strip():
+            self._session_summary = None
+            return self
+
+        self._session_summary = Message(
+            role=Role.SYSTEM,
+            content=f"[当前会话概要] {summary}",
+        )
+        logger.debug("ContextBuilder: 设置 Session Summary（{}字符）", len(summary))
         return self
 
     def estimate_compression_needed(self, conversation_messages: List[Message]) -> Optional["CompressionEstimate"]:
@@ -345,10 +466,11 @@ class ContextBuilder:
         count = self._token_counter.count_messages
         env_msg = self._build_environment_message()
 
-        skill_budget, knowledge_budget, memory_budget = self._compute_zone_budgets()
+        skill_budget, knowledge_budget, memory_budget, archive_budget = self._compute_zone_budgets()
         _, skill_tokens, _ = self._truncate_zone(self._skill_messages, skill_budget)
         _, kb_tokens, _ = self._truncate_zone(self._knowledge_messages, knowledge_budget)
         _, mem_tokens, _ = self._truncate_zone(self._memory_messages, memory_budget)
+        _, arc_tokens, _ = self._truncate_zone(self._archive_messages, archive_budget)
 
         non_history_tokens = (
             count(system_msgs)
@@ -356,10 +478,14 @@ class ContextBuilder:
             + skill_tokens
             + kb_tokens
             + mem_tokens
+            + arc_tokens
+            + (count([self._session_summary]) if self._session_summary else 0)
         )
 
         history_budget_val = max(effective_budget - non_history_tokens, 0)
-        history_tokens = count(history_msgs)
+        # 估算时也应用工具结果精简（与 build() Phase 3 一致）
+        compacted_history, _ = self._compact_tool_results(history_msgs, settings.agent.recent_window_size)
+        history_tokens = count(compacted_history)
         threshold = settings.agent.compression_threshold
 
         if history_budget_val > 0 and history_tokens > history_budget_val * threshold:
@@ -426,13 +552,14 @@ class ContextBuilder:
         使用 effective_input_budget（已扣除 tools schema 预留）作为基准。
 
         Returns:
-            (skill_budget, knowledge_budget, memory_budget) 三元组，单位为 tokens。
+            (skill_budget, knowledge_budget, memory_budget, archive_budget) 四元组，单位为 tokens。
         """
         budget = self.effective_input_budget
         return (
             int(budget * settings.agent.skill_zone_max_ratio),
             int(budget * settings.agent.knowledge_zone_max_ratio),
             int(budget * settings.agent.memory_zone_max_ratio),
+            int(budget * settings.agent.archive_zone_max_ratio),
         )
 
     def _truncate_zone(self, messages: List[Message], budget: int) -> tuple:
@@ -497,6 +624,112 @@ class ContextBuilder:
         actual_tokens = count([truncated_msg])
         return [truncated_msg], actual_tokens, True
 
+    def _compact_tool_results(
+        self,
+        history_msgs: List[Message],
+        recent_window_size: int,
+    ) -> tuple:
+        """精简 Recent Window 之外的工具返回消息，降低 History Zone token 占用。
+
+        策略：
+        - 最近 recent_window_size 条消息保持原样（完整保留工具交互细节）
+        - 更早的 TOOL role 消息：内容替换为一行摘要
+        - 更早的 ASSISTANT(tool_calls) 消息：保持原样（结构信息需保留给 LLM 理解对话流）
+        - 非 TOOL role 的普通消息：保持原样
+
+        此方法不修改 ConversationMemory 的实际数据，仅影响本次 build() 的输出，
+        与 Phase 4 紧急截断的设计理念一致。
+
+        Args:
+            history_msgs: 对话历史消息列表（不含 system prompt）。
+            recent_window_size: 最近 K 条消息完整保留的窗口大小。
+
+        Returns:
+            (compacted_messages, compacted_count) 二元组。
+            compacted_messages 与输入长度相同，仅 TOOL 消息内容被替换；
+            compacted_count 为被精简的 TOOL 消息数。
+        """
+        if not history_msgs or recent_window_size <= 0:
+            return history_msgs, 0
+
+        total = len(history_msgs)
+        if total <= recent_window_size:
+            return history_msgs, 0
+
+        # 分界点：recent_window_size 之前的是旧消息区域
+        old_boundary = total - recent_window_size
+        compacted = []
+        compacted_count = 0
+
+        for i, msg in enumerate(history_msgs):
+            if i < old_boundary and msg.role == Role.TOOL:
+                # 精简旧的工具返回内容
+                compact_content = self._make_tool_compact_summary(msg)
+                compacted.append(Message(
+                    role=msg.role,
+                    content=compact_content,
+                    tool_call_id=msg.tool_call_id,
+                    name=msg.name,
+                ))
+                compacted_count += 1
+            else:
+                compacted.append(msg)
+
+        if compacted_count > 0:
+            old_tokens = self._token_counter.count_messages(history_msgs)
+            new_tokens = self._token_counter.count_messages(compacted)
+            saved = old_tokens - new_tokens
+            logger.info(
+                "工具结果精简 | 精简 {} 条旧 tool 消息 | tokens: {} → {} (节省 {}, {:.0f}%)",
+                compacted_count, old_tokens, new_tokens, saved,
+                (saved / old_tokens * 100) if old_tokens > 0 else 0,
+            )
+
+        return compacted, compacted_count
+
+    @staticmethod
+    def _make_tool_compact_summary(msg: Message) -> str:
+        """为单条 TOOL 消息生成精简摘要。
+
+        策略：
+        - 尝试解析 JSON 提取结构信息（条目数、状态等）
+        - 识别错误/失败消息并保留
+        - 兜底：截取前 100 字符 + 省略标记
+
+        Args:
+            msg: TOOL role 的消息。
+
+        Returns:
+            精简后的摘要字符串。
+        """
+        content = msg.content or ""
+        tool_name = msg.name or "unknown"
+
+        if not content.strip():
+            return f"[工具 {tool_name} 返回空结果]"
+
+        # 识别错误消息 — 保留完整内容（通常较短）
+        error_indicators = ("error", "错误", "失败", "exception", "traceback", "failed")
+        content_lower = content.lower()
+        if any(ind in content_lower for ind in error_indicators):
+            # 错误信息通常不长，保留但截断到 500 字符
+            if len(content) <= 500:
+                return content
+            return content[:500] + "\n[... 错误详情已截断 ...]"
+
+        # 尝试 JSON 解析，提取结构信息
+        import json
+        try:
+            data = json.loads(content)
+            return _summarize_json_result(tool_name, data)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 兜底：纯文本截断
+        if len(content) <= 150:
+            return content
+        return f"[工具 {tool_name} 执行完成，返回 {len(content)} 字符结果]\n{content[:100]}..."
+
     def _emergency_truncate_history(
         self,
         system_msgs: List[Message],
@@ -504,6 +737,7 @@ class ContextBuilder:
         skill_msgs: List[Message],
         kb_msgs: List[Message],
         mem_msgs: List[Message],
+        arc_msgs: List[Message],
         history_msgs: List[Message],
         budget: int,
     ) -> tuple:
@@ -520,6 +754,7 @@ class ContextBuilder:
             skill_msgs: Skill Zone 消息。
             kb_msgs: Knowledge Zone 消息。
             mem_msgs: Memory Zone 消息。
+            arc_msgs: Archive Zone 消息。
             history_msgs: History Zone 消息（会被修改）。
             budget: 有效 messages 预算。
 
@@ -535,6 +770,7 @@ class ContextBuilder:
         non_history.extend(skill_msgs)
         non_history.extend(kb_msgs)
         non_history.extend(mem_msgs)
+        non_history.extend(arc_msgs)
         non_history_tokens = count(non_history) if non_history else 0
 
         # 计算 history 可用预算
@@ -600,17 +836,28 @@ class ContextBuilder:
             result.append(env_msg)
 
         # Phase 2: 可截断 Zone — 按预算上限截断
-        skill_budget, knowledge_budget, memory_budget = self._compute_zone_budgets()
+        skill_budget, knowledge_budget, memory_budget, archive_budget = self._compute_zone_budgets()
 
         skill_msgs, skill_tokens, skill_truncated = self._truncate_zone(self._skill_messages, skill_budget)
         kb_msgs, kb_tokens, kb_truncated = self._truncate_zone(self._knowledge_messages, knowledge_budget)
         mem_msgs, mem_tokens, mem_truncated = self._truncate_zone(self._memory_messages, memory_budget)
+        arc_msgs, arc_tokens, arc_truncated = self._truncate_zone(self._archive_messages, archive_budget)
 
         result.extend(skill_msgs)                     # Skill Zone（按预算截断）
         result.extend(kb_msgs)                        # Knowledge Zone（按预算截断）
         result.extend(mem_msgs)                       # Memory Zone（按预算截断）
+        result.extend(arc_msgs)                       # Archive Zone（按预算截断）
 
         # Phase 3: History Zone（剩余全部空间）
+        # 精简 Recent Window 之外的工具返回消息，降低 token 占用
+        history_msgs, tool_compacted_count = self._compact_tool_results(
+            history_msgs, settings.agent.recent_window_size,
+        )
+        # Session Summary 注入 History Zone 头部（逻辑上是 History 的全局概要）
+        session_summary_tokens = 0
+        if self._session_summary:
+            session_summary_tokens = count([self._session_summary])
+            history_msgs = [self._session_summary] + history_msgs
         result.extend(history_msgs)
 
         # 各 Zone Token 统计
@@ -620,7 +867,10 @@ class ContextBuilder:
         history_tokens = count(history_msgs)
 
         effective_budget = self.effective_input_budget
-        non_history_tokens = system_tokens + env_tokens + skill_tokens + kb_tokens + mem_tokens
+        non_history_tokens = (
+            system_tokens + env_tokens + skill_tokens + kb_tokens
+            + mem_tokens + arc_tokens + session_summary_tokens
+        )
         history_budget_val = max(effective_budget - non_history_tokens, 0) if effective_budget > 0 else 0
 
         # Phase 4: 最终安全检查 — 确保 total messages tokens ≤ effective_input_budget
@@ -634,18 +884,19 @@ class ContextBuilder:
                 total_tokens, effective_budget, overflow,
             )
             result, history_msgs, history_tokens = self._emergency_truncate_history(
-                system_msgs, env_msg, skill_msgs, kb_msgs, mem_msgs,
+                system_msgs, env_msg, skill_msgs, kb_msgs, mem_msgs, arc_msgs,
                 history_msgs, effective_budget,
             )
             history_truncated = True
             total_tokens = count(result)
 
-        if skill_truncated or kb_truncated or mem_truncated or history_truncated:
+        if skill_truncated or kb_truncated or mem_truncated or arc_truncated or history_truncated:
             logger.info(
-                "Zone 截断 | skill: {}→{}/{} | kb: {}→{}/{} | mem: {}→{}/{} | history: {}",
+                "Zone 截断 | skill: {}→{}/{} | kb: {}→{}/{} | mem: {}→{}/{} | arc: {}→{}/{} | history: {}",
                 "截断" if skill_truncated else "正常", skill_tokens, skill_budget,
                 "截断" if kb_truncated else "正常", kb_tokens, knowledge_budget,
                 "截断" if mem_truncated else "正常", mem_tokens, memory_budget,
+                "截断" if arc_truncated else "正常", arc_tokens, archive_budget,
                 "紧急截断" if history_truncated else "正常",
             )
 
@@ -655,6 +906,7 @@ class ContextBuilder:
             skill_tokens=skill_tokens,
             knowledge_tokens=kb_tokens,
             memory_tokens=mem_tokens,
+            archive_tokens=arc_tokens,
             history_tokens=history_tokens,
             total_tokens=total_tokens,
             history_budget=history_budget_val,
@@ -662,16 +914,20 @@ class ContextBuilder:
             skill_budget=skill_budget,
             knowledge_budget=knowledge_budget,
             memory_budget=memory_budget,
+            archive_budget=archive_budget,
             skill_truncated=skill_truncated,
             knowledge_truncated=kb_truncated,
             memory_truncated=mem_truncated,
+            archive_truncated=arc_truncated,
             history_truncated=history_truncated,
             tools_token_reserve=self._tools_token_reserve,
+            tool_results_compacted=tool_compacted_count,
+            session_summary_tokens=session_summary_tokens,
         )
 
         env_count = 1 if env_msg else 0
         skill_count = len(skill_msgs)
-        inject_count = len(kb_msgs) + len(mem_msgs)
+        inject_count = len(kb_msgs) + len(mem_msgs) + len(arc_msgs)
 
         logger.debug(
             "ContextBuilder.build | system={} env={} skill={} inject={} history={} total={} | tokens={} budget={}",

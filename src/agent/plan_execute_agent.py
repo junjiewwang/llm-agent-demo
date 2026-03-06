@@ -28,6 +28,8 @@ from src.context.builder import ContextBuilder
 from src.environment.adapter_base import EnvironmentAdapter
 from src.llm.base_client import BaseLLMClient, Message, Role
 from src.memory.conversation import ConversationMemory
+from src.memory.conversation_archive import ConversationArchive
+from src.memory.session_summary import SessionSummary
 from src.memory.vector_store import VectorStore
 from src.observability import get_tracer
 from src.observability.instruments import trace_span, set_span_content
@@ -90,6 +92,8 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         memory: ConversationMemory,
         context_builder: ContextBuilder,
         vector_store: Optional[VectorStore] = None,
+        conversation_archive: Optional[ConversationArchive] = None,
+        session_summary: Optional[SessionSummary] = None,
         knowledge_base: Optional["KnowledgeBase"] = None,
         skill_router: Optional["SkillRouter"] = None,
         env_adapter: Optional[EnvironmentAdapter] = None,
@@ -100,6 +104,8 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         super().__init__(llm_client, tool_registry, memory)
         self._context_builder = context_builder
         self._vector_store = vector_store
+        self._conversation_archive = conversation_archive
+        self._session_summary = session_summary
         self._knowledge_base = knowledge_base
         self._skill_router = skill_router
         self._env_adapter = env_adapter
@@ -181,6 +187,10 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
 
         # 将用户原始消息写入对话历史（持久化，不在 Scratchpad 范围内）
         self._memory.add_user_message(user_input)
+
+        # 注入 Session Summary（当前会话概要）
+        if self._session_summary and self._session_summary.summary:
+            self._context_builder.set_session_summary(self._session_summary.summary)
 
         # ── Phase 2: 逐步执行 ──
         while not plan.is_complete:
@@ -308,15 +318,17 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
             else:
                 tools_schema = self._tools.to_openai_tools() if len(self._tools) > 0 else None
 
-            # 执行器上下文隔离：清除 Skill 和 Memory 注入
+            # 执行器上下文隔离：清除 Skill、Memory 和 Archive 注入
             # 原因：Scratchpad 局部视图中消息极少（System + step_prompt + 工具交互），
             # 任何 SYSTEM 级注入信息的相对权重都会被极度放大，有"劫持"执行器的风险：
             # - Skill prompt → LLM 按 Skill 策略行事而忽略 step_prompt
             # - 长期记忆 → LLM 把旧记忆当作"先例"照搬（如"无法查询token用量"）
+            # - 对话归档 → 历史交互摘要可能误导当前步骤
             # step_prompt 已包含总目标和步骤指令，执行器只需工具即可完成任务。
             # KB 保留，因为它提供的是与当前查询直接相关的事实性文档片段。
             self._context_builder.set_skills([])
             self._context_builder.set_memory([])
+            self._context_builder.set_archive([])
 
             # 将子目标作为用户消息加入对话（在 Scratchpad 中）
             self._memory.add_user_message(step_prompt)
@@ -438,7 +450,7 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
             return None
 
     def _inject_context(self, query: str, metrics: RunMetrics) -> None:
-        """注入知识库、长期记忆和 Skills（首步时调用一次）。"""
+        """注入知识库、长期记忆、Skills 和对话归档（首步时调用一次）。"""
         # 知识库
         if self._knowledge_base and self._knowledge_base.count() > 0:
             threshold = settings.agent.kb_relevance_threshold
@@ -459,6 +471,15 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
                 metrics.memory_items_injected = len(relevant)
         else:
             self._context_builder.set_memory([])
+
+        # 对话归档
+        if self._conversation_archive and self._conversation_archive.count() > 0:
+            threshold = settings.agent.archive_relevance_threshold
+            top_k = settings.agent.archive_top_k
+            results = self._conversation_archive.search(query, top_k=top_k)
+            self._context_builder.set_archive(results, relevance_threshold=threshold)
+        else:
+            self._context_builder.set_archive([])
 
         # Skills
         if self._skill_router:
@@ -663,6 +684,8 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
             memory=self._memory,
             context_builder=self._context_builder,
             vector_store=self._vector_store,
+            conversation_archive=self._conversation_archive,
+            session_summary=self._session_summary,
             knowledge_base=self._knowledge_base,
             skill_router=self._skill_router,
             env_adapter=self._env_adapter,

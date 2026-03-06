@@ -29,6 +29,8 @@ from src.context.builder import ContextBuilder
 from src.environment.adapter_base import EnvironmentAdapter
 from src.llm.base_client import BaseLLMClient, Message, Role
 from src.memory.conversation import ConversationMemory
+from src.memory.conversation_archive import ConversationArchive
+from src.memory.session_summary import SessionSummary
 from src.memory.vector_store import VectorStore
 from src.observability import get_tracer
 from src.observability.instruments import (
@@ -66,6 +68,8 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         memory: ConversationMemory,
         context_builder: ContextBuilder,
         vector_store: Optional[VectorStore] = None,
+        conversation_archive: Optional[ConversationArchive] = None,
+        session_summary: Optional[SessionSummary] = None,
         knowledge_base: Optional["KnowledgeBase"] = None,
         skill_router: Optional["SkillRouter"] = None,
         env_adapter: Optional[EnvironmentAdapter] = None,
@@ -76,6 +80,8 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         super().__init__(llm_client, tool_registry, memory)
         self._context_builder = context_builder
         self._vector_store = vector_store
+        self._conversation_archive = conversation_archive
+        self._session_summary = session_summary
         self._knowledge_base = knowledge_base
         self._skill_router = skill_router
         self._env_adapter = env_adapter
@@ -174,12 +180,20 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         self._inject_long_term_memory(user_input, metrics)
         # 3. 匹配并注入 Skills（领域专家 prompt）
         self._inject_skills(user_input)
+        # 4. 检索对话归档，通过 ContextBuilder 临时注入
+        self._inject_archive(user_input)
 
-        # 4. 用户消息写入对话历史（这是真正应该持久化的）
+        # 5. 用户消息写入对话历史（这是真正应该持久化的）
         self._memory.add_user_message(user_input)
 
-        # 5. 检查是否需要压缩 History Zone（同步阻塞）
+        # 6. 检查是否需要压缩 History Zone（同步阻塞）
         self._check_and_compress(_emit)
+
+        # 7. 自动归档被挤出 Recent Window 的 Q&A 交互
+        self._auto_archive_evicted()
+
+        # 8. 注入 Session Summary（当前会话概要）
+        self._inject_session_summary()
 
         tools_schema = self._tools.to_openai_tools() if len(self._tools) > 0 else None
 
@@ -219,12 +233,15 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
                     max_iterations=self._max_iterations,
                 ))
 
-                self._store_to_long_term_memory(user_input, response.content or "", metrics)
+                answer = response.content or ""
+                self._store_to_long_term_memory(user_input, answer, metrics)
+                # 9. 交互完成后更新 Session Summary
+                self._post_interaction_update(user_input, answer, metrics)
                 self._context_builder.clear_injections()
                 metrics.finish()
                 self._last_metrics = metrics
                 logger.info("运行指标 | {}", metrics.summary())
-                return response.content or ""
+                return answer
 
             # 情况2: LLM 决定调用工具
             self._memory.add_assistant_message(response)
@@ -251,6 +268,8 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
 
         answer = self._force_final_answer(metrics)
         self._store_to_long_term_memory(user_input, answer, metrics)
+        # 达到最大迭代也更新 Session Summary
+        self._post_interaction_update(user_input, answer, metrics)
         self._context_builder.clear_injections()
         metrics.finish()
         self._last_metrics = metrics
@@ -370,6 +389,139 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
             logger.info("激活 Skills: {}", ", ".join(skill_names))
         else:
             self._context_builder.set_skills([])
+
+    def _inject_archive(self, query: str) -> None:
+        """检索对话归档，通过 ContextBuilder 临时注入历史交互摘要。
+
+        从 ConversationArchive 中按语义检索与当前查询相关的历史交互片段，
+        注入 Archive Zone。与长期记忆（关键事实）互补——归档保留完整交互上下文。
+        """
+        if not self._conversation_archive or self._conversation_archive.count() == 0:
+            self._context_builder.set_archive([])
+            return
+
+        threshold = settings.agent.archive_relevance_threshold
+        top_k = settings.agent.archive_top_k
+        results = self._conversation_archive.search(query, top_k=top_k)
+        self._context_builder.set_archive(results, relevance_threshold=threshold)
+
+        relevant = [r for r in results if r.get("distance", 1.0) < threshold]
+        if relevant:
+            logger.info("注入 {} 条对话归档片段（threshold={}）", len(relevant), threshold)
+
+    def _auto_archive_evicted(self) -> None:
+        """自动归档被挤出 Recent Window 的 Q&A 交互。
+
+        将 archive_watermark 之后、Recent Window 之前的消息配对归档到
+        ConversationArchive，实现消息三级生命周期的第二级：
+            Recent Window（完整）→ 自动归档（摘要化存入向量库）
+
+        归档粒度为完整的 Q&A 交互对（user + assistant），
+        跳过工具调用中间过程（assistant(tool_calls) + tool）。
+
+        依赖 SessionSummary.archive_watermark 追踪已归档进度，
+        避免重复归档。
+        """
+        if not self._conversation_archive or not self._session_summary:
+            return
+
+        messages = self._memory.messages
+        system_count = self._memory._system_prompt_count
+        recent_window = settings.agent.recent_window_size
+
+        # 可归档区域：system_prompt 之后、Recent Window 之前
+        non_system_msgs = messages[system_count:]
+        if len(non_system_msgs) <= recent_window:
+            return  # 所有消息都在 Recent Window 内
+
+        # 可归档区域的结束边界（Recent Window 之前）
+        archive_end = len(non_system_msgs) - recent_window
+        # 已归档水位线（相对于 system_prompt 之后的消息）
+        watermark = self._session_summary.archive_watermark
+
+        if watermark >= archive_end:
+            return  # 无新的可归档消息
+
+        # 收集待归档的 Q&A 交互对
+        new_msgs = non_system_msgs[watermark:archive_end]
+        interaction_pairs = []
+        current_pair: List[Message] = []
+
+        for msg in new_msgs:
+            if msg.role == Role.USER:
+                # 新交互开始：保存上一对
+                if current_pair:
+                    interaction_pairs.append(current_pair)
+                current_pair = [msg]
+            elif msg.role == Role.ASSISTANT and not msg.tool_calls:
+                # 最终回答（非工具调用），加入当前对
+                current_pair.append(msg)
+                interaction_pairs.append(current_pair)
+                current_pair = []
+            # 跳过 tool_calls 和 tool result 消息
+
+        # 逐对归档
+        archived = 0
+        for pair in interaction_pairs:
+            try:
+                self._conversation_archive.archive(pair)
+                archived += 1
+            except Exception as e:
+                logger.warning("自动归档失败: {}", e)
+
+        # 更新水位线
+        self._session_summary.archive_watermark = archive_end
+        if archived > 0:
+            logger.info("自动归档 {} 个 Q&A 交互 | watermark: {} → {}",
+                        archived, watermark, archive_end)
+
+    def _inject_session_summary(self) -> None:
+        """注入 Session Summary 到 ContextBuilder。
+
+        如果存在有效的会话概要，通过 ContextBuilder.set_session_summary()
+        注入到 History Zone 头部，使 LLM 在长对话中保持全局视野。
+        """
+        if not self._session_summary or not self._session_summary.summary:
+            return
+        self._context_builder.set_session_summary(self._session_summary.summary)
+
+    def _post_interaction_update(
+        self, user_input: str, answer: str, metrics: RunMetrics,
+    ) -> None:
+        """交互完成后更新 Session Summary。
+
+        在每次 Agent 给出最终回答后调用：
+        1. 记录交互计数
+        2. 检查是否达到更新间隔（每 N 轮）
+        3. 达到间隔时提取近期交互文本，调用 LLM 增量更新 summary
+
+        LLM 调用失败时静默降级（保留旧 summary），不阻塞对话流。
+        """
+        if not self._session_summary:
+            return
+
+        self._session_summary.record_interaction()
+
+        if not self._session_summary.should_update():
+            return
+
+        # 提取自上次更新以来的交互文本
+        messages = self._memory.messages
+        system_count = self._memory._system_prompt_count
+        # 从 archive_watermark 开始提取（归档之后的部分 + 当前 Recent Window）
+        start_index = system_count + self._session_summary.archive_watermark
+        recent_text = SessionSummary.extract_recent_interactions(
+            messages, system_count, start_index,
+        )
+
+        if not recent_text.strip():
+            return
+
+        logger.info("触发 Session Summary 增量更新 | interaction_count={}",
+                    self._session_summary.interaction_count)
+        self._session_summary.update(self._llm, recent_text)
+        # 记录 summary 更新的 LLM 调用（不在 RunMetrics 中独立记录，
+        # 因为 SessionSummary.update 内部的 LLM 调用不影响主链路统计）
 
     def _check_and_compress(self, _emit) -> None:
         """检查 History Zone 是否超过水位线，需要时同步触发压缩。

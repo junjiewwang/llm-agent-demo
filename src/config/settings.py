@@ -128,6 +128,7 @@ class AgentSettings(BaseSettings):
     env_adapter_enabled: bool = False  # 环境适配器（Sprint 3）
 
     # ── 上下文容量管理 ──
+    recent_window_size: int = 6  # Recent Window: 最近 K 条消息完整保留，更早的工具结果自动精简
     compression_threshold: float = 0.8  # History Zone 水位线（占 history_budget 的比例），超过则触发压缩
     compression_target_ratio: float = 0.6  # 压缩后目标占比（压缩到 history_budget * 此值）
 
@@ -136,6 +137,15 @@ class AgentSettings(BaseSettings):
     skill_zone_max_ratio: float = 0.15  # Skill Zone 最多占 input_budget 的 15%
     knowledge_zone_max_ratio: float = 0.15  # Knowledge Zone 最多占 input_budget 的 15%
     memory_zone_max_ratio: float = 0.05  # Memory Zone 最多占 input_budget 的 5%
+    archive_zone_max_ratio: float = 0.05  # Archive Zone 最多占 input_budget 的 5%
+
+    # ── 对话归档配置 ──
+    archive_relevance_threshold: float = 0.8  # 归档检索相关度阈值（cosine distance，低于此值才注入）
+    archive_top_k: int = 3  # 归档检索返回条数
+
+    # ── Session Summary 配置 ──
+    session_summary_interval: int = 3  # 每 N 轮 Q&A 交互触发一次 Session Summary 增量更新
+    session_summary_max_tokens: int = 300  # Summary LLM 输出的最大 token 数
 
     # ── Skill 匹配配置 ──
     skill_min_match_score: float = 0.15  # Skill 关键词匹配的最低分数阈值（低于此值不激活）

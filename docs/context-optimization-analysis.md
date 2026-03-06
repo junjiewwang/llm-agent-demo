@@ -275,11 +275,14 @@ class ToolResultCompactor:
 
 **目标**：减少 History Zone 中工具返回的 token 占比
 
-- [ ] `ConversationMemory` 新增 `compact_tool_results()` 方法
-  - 当消息超过 `recent_window_size` 时，自动精简旧的 tool result 消息
-  - 策略：成功 → `"[工具 {name} 执行成功，返回 {N} 条结果]"`；失败 → 保留错误
-- [ ] `ContextBuilder.build()` 中 History Phase 对非 Recent Window 的 tool result 自动截断
-- [ ] 配置项：`AGENT_RECENT_WINDOW_SIZE=6`
+- [x] `ConversationMemory` 不直接修改（精简逻辑在 `ContextBuilder` 层实现，非破坏性设计）
+- [x] `ContextBuilder.build()` 中 Phase 3 对非 Recent Window 的 tool result 自动精简
+  - 新增 `_compact_tool_results()` 方法（非破坏性，不修改 ConversationMemory 数据）
+  - 新增 `_make_tool_compact_summary()` 静态方法（JSON 结构感知 + 错误保留 + 兜底截断）
+  - 新增模块级 `_summarize_json_result()` 辅助函数（list/dict/标量 多态摘要）
+  - `estimate_compression_needed()` 同步应用精简，确保估算与 build 一致
+  - `ContextBuildStats` 新增 `tool_results_compacted` 统计字段
+- [x] 配置项：`AGENT_RECENT_WINDOW_SIZE=6`（`AgentSettings.recent_window_size`）
 
 **预期收益**：history_tokens 下降 50-60%，零架构改动
 
@@ -287,10 +290,25 @@ class ToolResultCompactor:
 
 **目标**：实现 Recent Window + Archive 分层架构
 
-- [ ] 新建 `src/memory/conversation_archive.py` — ChromaDB collection `conversation_archive`
-- [ ] 归档触发：消息被挤出 Recent Window 时，每个 Q&A 交互对生成摘要后存入
-- [ ] 检索注入：`ContextBuilder` 新增 Archive Zone（在 History Zone 前）
-- [ ] 预算调整：Archive Zone 分配 5% budget，History Zone 缩小为 Recent Window
+- [x] 新建 `src/memory/conversation_archive.py` — ChromaDB collection `archive-{tenant_id}`，支持 `archive()`、`search()`、`count()`、`clear()` 方法
+- [x] 归档触发：`archive()` 方法已实现（直接拼接 user/assistant 文本，无 LLM 依赖），持久化目录 `.agent_data/archive/{safe_id}`
+  - ⚠️ **遗留**：消息被挤出 Recent Window 时的自动归档触发钩子尚未接入运行时管线，当前需显式调用 `archive()`，可作为 Sprint 3 渐进式压缩的一部分集成
+- [x] 检索注入：`ContextBuilder` 新增 Archive Zone（在 Memory Zone 之后、History Zone 之前）
+  - `set_archive()` + `_archive_messages` 存储
+  - `build()` Phase 2 扩展为 4-tuple zone budgets，含 Archive 截断/注入
+  - `_emergency_truncate_history()` 扩展 `arc_msgs` 参数
+  - `ContextBuildStats` 新增 `archive_tokens`、`archive_budget`、`archive_truncated` 字段
+- [x] 预算调整：Archive Zone 分配 5% budget（`archive_zone_max_ratio=0.05`），History Zone 缩小为 Recent Window
+
+**涉及改动文件**：
+- `src/memory/conversation_archive.py`（新建）
+- `src/memory/__init__.py`（导出 ConversationArchive）
+- `src/config/settings.py`（新增 `archive_zone_max_ratio`、`archive_relevance_threshold`、`archive_top_k`）
+- `src/context/builder.py`（Archive Zone 集成 + stats 扩展）
+- `src/factory.py`（TenantSession 新增 `conversation_archive` 字段 + 初始化）
+- `src/agent/react_agent.py`（新增 `_inject_archive()` + 注入管线）
+- `src/agent/plan_execute_agent.py`（`_inject_context()` 归档注入 + `_execute_step()` 隔离清理）
+- `src/services/agent_service.py`（`zone_breakdown` 暴露 archive 可观测性字段）
 
 **预期收益**：history_tokens 再下降 60-70%，支持跨轮次相关信息召回
 
@@ -298,9 +316,37 @@ class ToolResultCompactor:
 
 **目标**：为长会话提供全局概要
 
-- [ ] 会话级摘要：每 N 轮交互（或每次归档时）增量更新当前会话的 summary
-- [ ] Summary 注入：作为 SYSTEM 消息 `[当前会话概要] ...` 注入 History Zone 头部
-- [ ] 渐进式压缩：摘要 → 归档 → 驱逐，三级递进
+- [x] 会话级摘要：每 N 轮交互增量更新当前会话的 summary
+  - 新建 `SessionSummary` 类，维护 `summary`、`interaction_count`、`archive_watermark` 三个核心状态
+  - 两种 LLM Prompt：`_SUMMARY_INIT_PROMPT`（首次生成）和 `_SUMMARY_UPDATE_PROMPT`（增量合并旧摘要+新交互）
+  - 输出约束 ≤200 字符，主题-结论要点格式，temperature=0.2
+  - `should_update()` 基于 `session_summary_interval=3`（每 3 轮交互触发一次）
+  - `record_interaction()` 递增计数，`update()` 调用 LLM 生成/更新摘要
+  - 配置项：`session_summary_interval=3`、`session_summary_max_tokens=300`
+- [x] Summary 注入：作为 SYSTEM 消息 `[当前会话概要] ...` 注入 History Zone 头部
+  - `ContextBuilder.set_session_summary()` 存储摘要文本
+  - `build()` Phase 3 在 History Zone 头部注入 `[当前会话概要] {summary}` SYSTEM 消息
+  - Summary token 开销（~200）从 History Zone 预算中扣除，通过 `non_history_tokens` 计算
+  - `ContextBuildStats` 新增 `session_summary_tokens` 统计字段
+  - 非破坏性设计：`clear_injections()` 不清除 session summary（持续整个会话生命周期）
+- [x] 渐进式压缩：摘要 → 归档 → 驱逐，三级递进
+  - `_auto_archive_evicted()`：消息被挤出 Recent Window 时自动归档到 ConversationArchive（补齐 Sprint 2 遗留的自动触发钩子）
+  - 使用 `archive_watermark` 跟踪已归档位置，避免重复归档
+  - 消息按 Q&A 交互对分组（user + 最终 assistant 回答），跳过中间 tool_calls/tool 消息
+  - `_post_interaction_update()`：每次 Agent 回答后调用，记录交互次数并按间隔触发 LLM 摘要更新
+  - 完整生命周期：消息 → Recent Window（完整）→ 挤出 → 自动归档到 Archive（摘要化）+ 更新 Session Summary → 超过 max_messages → `_smart_truncate` 驱逐
+  - 优雅降级：Summary 更新失败静默保留旧摘要，Archive 失败记录 warning，均不阻塞主流程
+  - SessionSummary 持久化：`serialize()`/`restore_from()` 支持会话恢复
+
+**涉及改动文件**：
+- `src/memory/session_summary.py`（新建 — SessionSummary 类）
+- `src/memory/__init__.py`（导出 SessionSummary）
+- `src/config/settings.py`（新增 `session_summary_interval`、`session_summary_max_tokens`）
+- `src/context/builder.py`（`set_session_summary()` + build Phase 3 注入 + `session_summary_tokens` stats）
+- `src/agent/react_agent.py`（新增 `_auto_archive_evicted()`、`_inject_session_summary()`、`_post_interaction_update()` 三个方法 + `_run_loop()` 管线集成）
+- `src/agent/plan_execute_agent.py`（`__init__` 接收 `session_summary` + `_run_plan_execute` Summary 注入 + `_fallback_direct_answer` 透传）
+- `src/factory.py`（`Conversation` dataclass 新增 `session_summary` 字段 + `create/restore_conversation` 生命周期管理）
+- `src/services/agent_service.py`（`_save_tenant` 持久化 SessionSummary + `zone_breakdown` 暴露 `session_summary_tokens`）
 
 **预期收益**：即使 100+ 轮对话，LLM 仍有全局视野
 

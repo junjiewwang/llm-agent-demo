@@ -20,7 +20,8 @@ from src.context import ContextBuilder
 from src.context.builder import default_environment, tool_environment
 from src.environment.tool_env_adapter import ToolEnvAdapter
 from src.llm import OpenAIClient
-from src.memory import ConversationMemory, MemoryGovernor, VectorStore
+from src.memory import ConversationMemory, MemoryGovernor, VectorStore, ConversationArchive
+from src.memory.session_summary import SessionSummary
 from src.rag import KnowledgeBase
 from src.skills import SkillRegistry, SkillRouter, load_from_directory
 from src.tools import (
@@ -81,6 +82,7 @@ class Conversation:
     title: str
     memory: ConversationMemory
     agent: BaseAgent  # ReActAgent 或 PlanExecuteAgent
+    session_summary: Optional[SessionSummary] = None
     created_at: float = field(default_factory=time.time)
     chat_history: List[dict] = field(default_factory=list)
 
@@ -102,6 +104,7 @@ class TenantSession:
 
     tenant_id: str
     vector_store: Optional[VectorStore]
+    conversation_archive: Optional[ConversationArchive] = None
     governor: Optional[MemoryGovernor] = None
     conversations: Dict[str, Conversation] = field(default_factory=dict)
     active_conv_id: Optional[str] = None
@@ -383,11 +386,12 @@ def create_shared_components() -> SharedComponents:
 
 
 def create_tenant_session(tenant_id: str) -> TenantSession:
-    """为租户创建会话（包含独立的长期记忆和可选的 Governor）。"""
+    """为租户创建会话（包含独立的长期记忆、对话归档和可选的 Governor）。"""
     # ChromaDB collection name 要求 3-63 字符，[a-zA-Z0-9._-]，不能以 _ 结尾
     safe_id = tenant_id[:16] if tenant_id else uuid.uuid4().hex[:16]
     vector_store: Optional[VectorStore] = None
     governor: Optional[MemoryGovernor] = None
+    conversation_archive: Optional[ConversationArchive] = None
 
     try:
         vector_store = VectorStore(
@@ -398,6 +402,15 @@ def create_tenant_session(tenant_id: str) -> TenantSession:
     except Exception as e:
         logger.warning("租户 {} 长期记忆初始化失败: {}", safe_id[:8], e)
 
+    # ConversationArchive: 对话历史的向量化归档存储
+    try:
+        conversation_archive = ConversationArchive(
+            collection_name=f"archive-{safe_id}",
+            persist_directory=f".agent_data/archive/{safe_id}",
+        )
+    except Exception as e:
+        logger.warning("租户 {} 对话归档初始化失败: {}", safe_id[:8], e)
+
     # Governor: Feature Flag 开启时创建并启动后台治理
     if vector_store and settings.agent.memory_governor_enabled:
         governor = MemoryGovernor(vector_store)
@@ -407,6 +420,7 @@ def create_tenant_session(tenant_id: str) -> TenantSession:
     return TenantSession(
         tenant_id=tenant_id,
         vector_store=vector_store,
+        conversation_archive=conversation_archive,
         governor=governor,
     )
 
@@ -416,6 +430,7 @@ def _create_agent(
     tenant: TenantSession,
     memory: ConversationMemory,
     context_builder: ContextBuilder,
+    session_summary: Optional[SessionSummary] = None,
     env_adapter=None,
 ) -> BaseAgent:
     """根据 feature flag 创建 ReActAgent 或 PlanExecuteAgent。
@@ -429,6 +444,8 @@ def _create_agent(
         memory=memory,
         context_builder=context_builder,
         vector_store=tenant.vector_store,
+        conversation_archive=tenant.conversation_archive,
+        session_summary=session_summary,
         knowledge_base=shared.knowledge_base,
         skill_router=shared.skill_router,
         env_adapter=env_adapter,
@@ -468,11 +485,15 @@ def create_conversation(
     if settings.agent.env_adapter_enabled:
         env_adapter = ToolEnvAdapter(shared.tool_registry)
 
+    # Session Summary: 会话级增量摘要管理器
+    session_summary = SessionSummary()
+
     agent = _create_agent(
         shared=shared,
         tenant=tenant,
         memory=memory,
         context_builder=context_builder,
+        session_summary=session_summary,
         env_adapter=env_adapter,
     )
 
@@ -481,6 +502,7 @@ def create_conversation(
         title=title,
         memory=memory,
         agent=agent,
+        session_summary=session_summary,
     )
 
     tenant.conversations[conv_id] = conv
@@ -529,11 +551,18 @@ def restore_conversation(
     if settings.agent.env_adapter_enabled:
         env_adapter = ToolEnvAdapter(shared.tool_registry)
 
+    # 恢复 SessionSummary
+    session_summary = SessionSummary()
+    summary_data = conv_data.get("session_summary")
+    if summary_data:
+        session_summary.restore_from(summary_data)
+
     agent = _create_agent(
         shared=shared,
         tenant=tenant,
         memory=memory,
         context_builder=context_builder,
+        session_summary=session_summary,
         env_adapter=env_adapter,
     )
 
@@ -542,6 +571,7 @@ def restore_conversation(
         title=conv_data.get("title", "恢复的对话"),
         memory=memory,
         agent=agent,
+        session_summary=session_summary,
         created_at=conv_data.get("created_at", time.time()),
         chat_history=conv_data.get("chat_history", []),
     )

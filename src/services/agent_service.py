@@ -130,7 +130,7 @@ class AgentService:
         conversations = {}
         for conv_id, conv in tenant.conversations.items():
             serialized = conv.memory.serialize()
-            conversations[conv_id] = {
+            conv_entry = {
                 "id": conv.id,
                 "title": conv.title,
                 "created_at": conv.created_at,
@@ -138,6 +138,10 @@ class AgentService:
                 "memory_messages": serialized["messages"],
                 "system_prompt_count": serialized["system_prompt_count"],
             }
+            # 持久化 SessionSummary 状态
+            if conv.session_summary:
+                conv_entry["session_summary"] = conv.session_summary.serialize()
+            conversations[conv_id] = conv_entry
 
         self._session_store.save_tenant(
             tenant_id=tenant_id,
@@ -651,14 +655,18 @@ class AgentService:
                         "skill_tokens": build_stats.skill_tokens,
                         "knowledge_tokens": build_stats.knowledge_tokens,
                         "memory_tokens": build_stats.memory_tokens,
+                        "archive_tokens": build_stats.archive_tokens,
+                        "session_summary_tokens": build_stats.session_summary_tokens,
                         "history_tokens": build_stats.history_tokens,
                         "input_budget": build_stats.input_budget,
                         "skill_budget": build_stats.skill_budget,
                         "knowledge_budget": build_stats.knowledge_budget,
                         "memory_budget": build_stats.memory_budget,
+                        "archive_budget": build_stats.archive_budget,
                         "skill_truncated": build_stats.skill_truncated,
                         "knowledge_truncated": build_stats.knowledge_truncated,
                         "memory_truncated": build_stats.memory_truncated,
+                        "archive_truncated": build_stats.archive_truncated,
                     }
                 status["current_conversation"] = conv_status
             if tenant.vector_store:
