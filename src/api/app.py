@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from src.api.dependencies import get_service
-from src.api.routers import chat, session, knowledge, status, auth, skills
+from src.api.routers import chat, session, knowledge, status, auth, skills, mcp
 from src.observability import init_telemetry, shutdown_telemetry
 from src.utils.logger import logger
 
@@ -34,6 +34,10 @@ async def lifespan(app: FastAPI):
         logger.warning("AgentService 初始化跳过（将在首次请求时重试）: {}", e)
 
     yield
+
+    # 关闭 MCP Server 连接和子进程
+    if service.shared and service.shared.mcp_manager:
+        service.shared.mcp_manager.shutdown()
 
     # 清理 OTel 资源（flush pending spans/metrics）
     shutdown_telemetry()
@@ -67,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(knowledge.router, prefix="/api", tags=["知识库"])
     app.include_router(status.router, prefix="/api", tags=["系统状态"])
     app.include_router(skills.router, prefix="/api", tags=["技能管理"])
+    app.include_router(mcp.router, prefix="/api", tags=["MCP"])
 
     # 生产模式：托管 React 构建产物
     frontend_dist = os.path.join(os.path.dirname(__file__), "../../frontend/dist")

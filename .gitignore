@@ -42,3 +42,6 @@ frontend/dist/
 
 # 截图图片
 *.png
+
+# mcp.json
+.mcp.json

@@ -7,6 +7,7 @@ from src.tools.web_search import WebSearchTool
 from src.tools.knowledge_search import KnowledgeSearchTool
 from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
 from src.tools.devops import BashExecutor, BinaryPolicy, ExecuteCommandTool
+from src.tools.mcp import MCPToolManager, MCPTool
 
 __all__ = [
     "BaseTool",
@@ -26,4 +27,6 @@ __all__ = [
     "BashExecutor",
     "BinaryPolicy",
     "ExecuteCommandTool",
+    "MCPToolManager",
+    "MCPTool",
 ]

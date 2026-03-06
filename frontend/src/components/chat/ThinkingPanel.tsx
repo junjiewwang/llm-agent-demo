@@ -132,12 +132,56 @@ const DEFAULT_TOOL_META: ToolMeta = {
   label: '工具',
 }
 
+/** MCP 外部工具的默认图标（插头 icon + 紫色） */
+const MCP_TOOL_ICON = (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+  </svg>
+)
+
+/**
+ * 解析 MCP 工具名称：mcp__{server}__{tool}
+ * 返回 { server, tool } 或 null（非 MCP 工具）
+ */
+function parseMCPToolName(name: string): { server: string; tool: string } | null {
+  if (!name.startsWith('mcp__')) return null
+  const rest = name.slice(5) // 去掉 "mcp__"
+  const sepIdx = rest.indexOf('__')
+  if (sepIdx < 0) return null
+  return { server: rest.slice(0, sepIdx), tool: rest.slice(sepIdx + 2) }
+}
+
 function getToolMeta(name: string): ToolMeta {
-  return TOOL_META[name] || DEFAULT_TOOL_META
+  // 内置工具直接查表
+  if (TOOL_META[name]) return TOOL_META[name]
+
+  // MCP 外部工具：动态生成 meta
+  const mcp = parseMCPToolName(name)
+  if (mcp) {
+    return {
+      icon: MCP_TOOL_ICON,
+      color: 'text-violet-500',
+      label: `MCP:${mcp.server}`,
+    }
+  }
+
+  return DEFAULT_TOOL_META
 }
 
 /** 从工具参数中提取有意义的标题文本 */
 function getToolTitle(toolName: string, args: Record<string, unknown>): string {
+  // MCP 工具：展示 server:tool + 首参数预览
+  const mcp = parseMCPToolName(toolName)
+  if (mcp) {
+    const entries = Object.entries(args)
+    if (entries.length > 0) {
+      const val = typeof entries[0][1] === 'string' ? entries[0][1] : JSON.stringify(entries[0][1])
+      const preview = val.length > 80 ? val.slice(0, 80) + '...' : val
+      return `${mcp.tool} → ${preview}`
+    }
+    return mcp.tool
+  }
+
   switch (toolName) {
     case 'execute_command':
       return (args.command as string) || toolName
@@ -191,6 +235,7 @@ function ToolCard({
   const [expanded, setExpanded] = useState(false)
   const [copied, setCopied] = useState(false)
   const meta = getToolMeta(callEvent.tool_name)
+  const mcpInfo = parseMCPToolName(callEvent.tool_name)
   const isRunning = !resultEvent
   const isSuccess = resultEvent?.success ?? false
   const duration = resultEvent ? (resultEvent.duration_ms / 1000).toFixed(1) : null
@@ -241,6 +286,11 @@ function ToolCard({
               </svg>
             )}
           </span>
+          {mcpInfo && (
+            <span className="text-[9px] px-1 py-0.5 rounded bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-400 font-medium">
+              ⚡{mcpInfo.server}
+            </span>
+          )}
           {parallel && (
             <span className="text-[9px] px-1 py-0.5 rounded bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-400 font-medium">
               ⚡{callEvent.parallel_index}/{callEvent.parallel_total}

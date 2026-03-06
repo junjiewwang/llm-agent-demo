@@ -115,6 +115,22 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return self
 
+    def unregister(self, name: str) -> "ToolRegistry":
+        """移除已注册的工具，同时清理指向该工具的别名。
+
+        Args:
+            name: 工具名称（必须是真实名称，不能是别名）。
+
+        Raises:
+            KeyError: 工具未注册。
+        """
+        if name not in self._tools:
+            raise KeyError(f"工具 '{name}' 未注册")
+        del self._tools[name]
+        # 清理指向该工具的别名
+        self._aliases = {a: t for a, t in self._aliases.items() if t != name}
+        return self
+
     def register_alias(self, alias: str, target: str) -> "ToolRegistry":
         """为已注册的工具注册别名，支持链式调用。
 

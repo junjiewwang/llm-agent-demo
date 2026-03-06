@@ -29,6 +29,7 @@ from src.tools import (
 from src.tools.filesystem import Sandbox, FileReaderTool, FileWriterTool
 from src.tools.devops import BashExecutor, ExecuteCommandTool
 from src.tools.devops.policies import ALL_POLICIES, PIPE_TOOLS
+from src.tools.mcp import MCPToolManager
 from src.config import settings
 from src.utils.logger import logger
 
@@ -92,6 +93,7 @@ class SharedComponents:
     tool_registry: ToolRegistry
     knowledge_base: Optional[KnowledgeBase] = None
     skill_router: Optional[SkillRouter] = None
+    mcp_manager: Optional[MCPToolManager] = None
 
 
 @dataclass
@@ -139,8 +141,14 @@ class AgentComponents:
 
 # ── 工厂函数 ──
 
-def create_tool_registry(knowledge_base: Optional[KnowledgeBase]) -> ToolRegistry:
-    """创建并注册所有可用工具。"""
+def create_tool_registry(
+    knowledge_base: Optional[KnowledgeBase],
+) -> tuple[ToolRegistry, Optional[MCPToolManager]]:
+    """创建并注册所有可用工具（含 MCP 外部工具）。
+
+    Returns:
+        (ToolRegistry, MCPToolManager or None) 元组。
+    """
     registry = ToolRegistry()
     registry.register(CalculatorTool())
     registry.register(DateTimeTool())
@@ -171,7 +179,10 @@ def create_tool_registry(knowledge_base: Optional[KnowledgeBase]) -> ToolRegistr
     # DevOps 工具：按配置按需注册
     _register_devops_tools(registry)
 
-    return registry
+    # MCP 外部工具：从 .mcp.json 发现并注册
+    mcp_manager = _register_mcp_tools(registry)
+
+    return registry, mcp_manager
 
 
 def _register_devops_tools(registry: ToolRegistry) -> None:
@@ -240,6 +251,30 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
         sorted(ns_whitelist) if ns_whitelist else "无",
         sorted(curl_allowed_hosts) if curl_allowed_hosts else "无",
     )
+
+
+def _register_mcp_tools(registry: ToolRegistry) -> Optional[MCPToolManager]:
+    """从 .mcp.json 发现 MCP 外部工具并注册到 ToolRegistry。
+
+    单个 Server 连接失败不阻塞其他 Server 和整体启动流程。
+
+    Returns:
+        MCPToolManager 实例（用于 shutdown），无配置时返回 None。
+    """
+    manager = MCPToolManager(config_path=".mcp.json")
+    try:
+        count = manager.discover_and_register(registry)
+        if count > 0:
+            return manager
+    except Exception as e:
+        logger.warning("MCP 工具发现失败（不影响内置工具）: {}", e)
+
+    # 没有注册任何工具时，清理资源
+    try:
+        manager.shutdown()
+    except Exception:
+        pass
+    return None
 
 
 def create_skill_router(tool_registry: ToolRegistry) -> SkillRouter:
@@ -333,7 +368,7 @@ def create_shared_components() -> SharedComponents:
     except Exception as e:
         logger.warning("知识库初始化失败: {}", e)
 
-    tool_registry = create_tool_registry(knowledge_base)
+    tool_registry, mcp_manager = create_tool_registry(knowledge_base)
     skill_router = create_skill_router(tool_registry)
 
     _log_feature_flags()
@@ -343,6 +378,7 @@ def create_shared_components() -> SharedComponents:
         tool_registry=tool_registry,
         knowledge_base=knowledge_base,
         skill_router=skill_router,
+        mcp_manager=mcp_manager,
     )
 
 
