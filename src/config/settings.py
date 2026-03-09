@@ -3,6 +3,9 @@
 每个子配置类独立读取 .env 文件，通过 env_prefix 区分不同配置组。
 """
 
+from typing import Any
+
+from typing_extensions import override
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,7 +71,8 @@ class LLMSettings(BaseSettings):
         "llama": 8_192,
     }
 
-    def model_post_init(self, __context):
+    @override
+    def model_post_init(self, __context: Any) -> None:
         """初始化后自动推导 context_window。"""
         super().model_post_init(__context)
         if self.context_window == 0:
@@ -95,7 +99,7 @@ class LLMSettings(BaseSettings):
         # 4. 兜底
         return 8_192
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="LLM_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -156,7 +160,7 @@ class AgentSettings(BaseSettings):
     memory_min_value_score: float = 0.1  # 低于此分值的记忆将被驱逐
     memory_merge_threshold: float = 0.15  # cosine distance 低于此值触发归并
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="AGENT_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -175,7 +179,7 @@ class SearchSettings(BaseSettings):
     backend: str = "auto"
     tavily_api_key: str = ""
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="SEARCH_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -204,7 +208,7 @@ class FilesystemSettings(BaseSettings):
     max_depth: int = 5
     max_results: int = 50
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="FILESYSTEM_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -235,7 +239,7 @@ class CommandSettings(BaseSettings):
     curl_allowed_hosts: str = ""
     confirm_writes: bool = True
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="COMMAND_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -266,7 +270,7 @@ class OtelSettings(BaseSettings):
     log_content: bool = False
     log_content_max_length: int = 4096
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="OTEL_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -285,7 +289,7 @@ class SkillSettings(BaseSettings):
     dirs: str = "skills"
     disabled: str = ""
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="SKILLS_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -305,7 +309,7 @@ class AuthSettings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 10080  # 7 days
 
-    model_config = SettingsConfigDict(
+    model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix="AUTH_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -316,18 +320,18 @@ class AuthSettings(BaseSettings):
 class Settings:
     """全局配置聚合，各子配置独立加载 .env。"""
 
-    def __init__(self):
-        self.llm = LLMSettings()
-        self.agent = AgentSettings()
-        self.search = SearchSettings()
-        self.filesystem = FilesystemSettings()
-        self.command = CommandSettings()
-        self.otel = OtelSettings()
-        self.skills = SkillSettings()
-        self.auth = AuthSettings()
+    def __init__(self) -> None:
+        self.llm: LLMSettings = LLMSettings()
+        self.agent: AgentSettings = AgentSettings()
+        self.search: SearchSettings = SearchSettings()
+        self.filesystem: FilesystemSettings = FilesystemSettings()
+        self.command: CommandSettings = CommandSettings()
+        self.otel: OtelSettings = OtelSettings()
+        self.skills: SkillSettings = SkillSettings()
+        self.auth: AuthSettings = AuthSettings()
         self._validate_cross_config()
 
-    def _validate_cross_config(self):
+    def _validate_cross_config(self) -> None:
         """跨配置组的一致性校验。"""
         ctx = self.llm.context_window
         out = self.agent.max_tokens
@@ -335,8 +339,8 @@ class Settings:
             import warnings
             warnings.warn(
                 f"AGENT_MAX_TOKENS({out}) >= LLM_CONTEXT_WINDOW({ctx})，"
-                f"input_budget 将为 0。请检查模型映射表或 .env 配置。"
-                f"当前模型: {self.llm.model}",
+                + f"input_budget 将为 0。请检查模型映射表或 .env 配置。"
+                + f"当前模型: {self.llm.model}",
                 stacklevel=2,
             )
 

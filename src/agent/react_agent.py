@@ -15,9 +15,13 @@
 - 检测到循环时自动插入引导 prompt，让 LLM 换种方式回答
 """
 
+from __future__ import annotations
+
 import re
 import time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
+
+from typing_extensions import override
 
 from src.agent.base_agent import BaseAgent, OnEventCallback, WaitForConfirmation
 from src.agent.events import AgentEvent, AgentStoppedError, EventType
@@ -41,6 +45,7 @@ from src.tools.base_tool import ToolRegistry
 from src.utils.logger import logger
 
 if TYPE_CHECKING:
+    from opentelemetry.trace import Span
     from src.rag.knowledge_base import KnowledgeBase
     from src.skills.router import SkillRouter
 
@@ -67,29 +72,29 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         tool_registry: ToolRegistry,
         memory: ConversationMemory,
         context_builder: ContextBuilder,
-        vector_store: Optional[VectorStore] = None,
-        conversation_archive: Optional[ConversationArchive] = None,
-        session_summary: Optional[SessionSummary] = None,
-        knowledge_base: Optional["KnowledgeBase"] = None,
-        skill_router: Optional["SkillRouter"] = None,
-        env_adapter: Optional[EnvironmentAdapter] = None,
-        max_iterations: Optional[int] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        vector_store: VectorStore | None = None,
+        conversation_archive: ConversationArchive | None = None,
+        session_summary: SessionSummary | None = None,
+        knowledge_base: KnowledgeBase | None = None,
+        skill_router: SkillRouter | None = None,
+        env_adapter: EnvironmentAdapter | None = None,
+        max_iterations: int | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ):
         super().__init__(llm_client, tool_registry, memory)
-        self._context_builder = context_builder
-        self._vector_store = vector_store
-        self._conversation_archive = conversation_archive
-        self._session_summary = session_summary
-        self._knowledge_base = knowledge_base
-        self._skill_router = skill_router
-        self._env_adapter = env_adapter
-        self._max_iterations = max_iterations or settings.agent.max_iterations
-        self._temperature = temperature or settings.agent.temperature
-        self._max_tokens = max_tokens or settings.agent.max_tokens
-        self._last_metrics: Optional[RunMetrics] = None
-        self._loop_detector = LoopDetector()
+        self._context_builder: ContextBuilder = context_builder
+        self._vector_store: VectorStore | None = vector_store
+        self._conversation_archive: ConversationArchive | None = conversation_archive
+        self._session_summary: SessionSummary | None = session_summary
+        self._knowledge_base: KnowledgeBase | None = knowledge_base
+        self._skill_router: SkillRouter | None = skill_router
+        self._env_adapter: EnvironmentAdapter | None = env_adapter
+        self._max_iterations: int = max_iterations or settings.agent.max_iterations
+        self._temperature: float = temperature or settings.agent.temperature
+        self._max_tokens: int = max_tokens or settings.agent.max_tokens
+        self._last_metrics: RunMetrics | None = None
+        self._loop_detector: LoopDetector = LoopDetector()
 
     @property
     def context_builder(self) -> ContextBuilder:
@@ -97,10 +102,11 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         return self._context_builder
 
     @property
-    def last_metrics(self) -> Optional[RunMetrics]:
+    def last_metrics(self) -> RunMetrics | None:
         """获取最近一次 run() 的运行指标。"""
         return self._last_metrics
 
+    @override
     def run(
         self,
         user_input: str,
@@ -130,7 +136,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
             try:
                 result = self._run_loop(
                     user_input, metrics, _emit,
-                    on_event is not None, wait_for_confirmation,
+                    wait_for_confirmation=wait_for_confirmation,
                 )
                 set_span_content(span, "agent.output", result)
                 self._set_metrics_on_span(span, metrics)
@@ -145,7 +151,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
                 raise
 
     @staticmethod
-    def _set_metrics_on_span(span, metrics: RunMetrics, stopped: bool = False) -> None:
+    def _set_metrics_on_span(span: Span, metrics: RunMetrics, stopped: bool = False) -> None:
         """将 RunMetrics 批量写入 span attributes。"""
         span.set_attribute("agent.iterations", metrics.iterations)
         span.set_attribute("agent.llm_calls", metrics.llm_call_count)
@@ -170,8 +176,9 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         )
 
     def _run_loop(
-        self, user_input: str, metrics: RunMetrics, _emit,
-        has_callback: bool, wait_for_confirmation: WaitForConfirmation = None,
+        self, user_input: str, metrics: RunMetrics,
+        _emit: Callable[[AgentEvent], None],
+        wait_for_confirmation: WaitForConfirmation = None,
     ) -> str:
         """ReAct 核心循环，从 run() 中分离以便统一异常处理。"""
         # 1. 检索知识库，通过 ContextBuilder 临时注入（不写入 ConversationMemory）
@@ -343,7 +350,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
                 if settings.agent.memory_governor_enabled:
                     self._writeback_memory_hits(relevant)
 
-    def _writeback_memory_hits(self, relevant_memories: List[Dict[str, Any]]) -> None:
+    def _writeback_memory_hits(self, relevant_memories: list[dict[str, Any]]) -> None:
         """异步更新命中记忆的 hit_count 和 last_hit。
 
         使用后台线程执行，不阻塞主请求链路。
@@ -426,7 +433,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
             return
 
         messages = self._memory.messages
-        system_count = self._memory._system_prompt_count
+        system_count = self._memory.system_prompt_count
         recent_window = settings.agent.recent_window_size
 
         # 可归档区域：system_prompt 之后、Recent Window 之前
@@ -445,7 +452,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         # 收集待归档的 Q&A 交互对
         new_msgs = non_system_msgs[watermark:archive_end]
         interaction_pairs = []
-        current_pair: List[Message] = []
+        current_pair: list[Message] = []
 
         for msg in new_msgs:
             if msg.role == Role.USER:
@@ -507,7 +514,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
 
         # 提取自上次更新以来的交互文本
         messages = self._memory.messages
-        system_count = self._memory._system_prompt_count
+        system_count = self._memory.system_prompt_count
         # 从 archive_watermark 开始提取（归档之后的部分 + 当前 Recent Window）
         start_index = system_count + self._session_summary.archive_watermark
         recent_text = SessionSummary.extract_recent_interactions(
@@ -523,7 +530,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         # 记录 summary 更新的 LLM 调用（不在 RunMetrics 中独立记录，
         # 因为 SessionSummary.update 内部的 LLM 调用不影响主链路统计）
 
-    def _check_and_compress(self, _emit) -> None:
+    def _check_and_compress(self, _emit: Callable[[AgentEvent], None]) -> None:
         """检查 History Zone 是否超过水位线，需要时同步触发压缩。
 
         在 ReAct 循环开始前调用。使用 ContextBuilder.estimate_compression_needed()
@@ -556,7 +563,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         ))
 
     def _store_to_long_term_memory(self, user_input: str, answer: str,
-                                   metrics: Optional[RunMetrics] = None) -> None:
+                                   metrics: RunMetrics | None = None) -> None:
         """将对话中的关键事实提取并存储到长期记忆。
 
         使用 LLM 从 Q&A 中提取值得记住的关键事实（偏好、结论、数据），
@@ -616,7 +623,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
             logger.debug("对话已存入长期记忆（回退模式）")
 
     def _extract_key_facts(self, user_input: str, answer: str,
-                           metrics: Optional[RunMetrics] = None) -> Optional[dict]:
+                           metrics: RunMetrics | None = None) -> dict[str, Any] | None:
         """使用 LLM 从对话中提取值得长期记住的关键事实，并判断时变性。
 
         Returns:
@@ -694,7 +701,7 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
             logger.warning("关键事实提取失败: {}", e)
             return None
 
-    def _force_final_answer(self, metrics: Optional[RunMetrics] = None) -> str:
+    def _force_final_answer(self, metrics: RunMetrics | None = None) -> str:
         """强制 LLM 基于当前上下文给出最终回答（不再调用工具）。"""
         self._memory.add_user_message(
             "请根据以上所有工具调用的结果，直接给出最终的完整回答，不要再调用任何工具。"
@@ -714,23 +721,23 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
 
 # Emoji Unicode 范围正则
 _EMOJI_PATTERN = re.compile(
-    "[\U0001F300-\U0001F9FF"   # 各类表情符号
-    "\U00002702-\U000027B0"    # 杂项符号
-    "\U0000FE00-\U0000FE0F"    # 变体选择符
-    "\U0000200D"               # 零宽连接符
-    "]+",
+    "[\U0001F300-\U0001F9FF"
+    + "\U00002702-\U000027B0"
+    + "\U0000FE00-\U0000FE0F"
+    + "\U0000200D"
+    + "]+",
     flags=re.UNICODE,
 )
 
 # Markdown 格式标记正则
 _MARKDOWN_PATTERN = re.compile(
-    r"#{1,6}\s+"               # 标题 ## xxx
-    r"|(?<!\S)\*{1,3}|"       # 加粗/斜体 **xxx** *xxx*
-    r"\*{1,3}(?!\S)"
-    r"|(?<!\S)_{1,2}|"        # 下划线强调 __xxx__
-    r"_{1,2}(?!\S)"
-    r"|^[-*+]\s+"              # 列表项 - xxx / * xxx
-    r"|^\d+\.\s+",             # 有序列表 1. xxx
+    r"#{1,6}\s+"
+    + r"|(?<!\S)\*{1,3}|"
+    + r"\*{1,3}(?!\S)"
+    + r"|(?<!\S)_{1,2}|"
+    + r"_{1,2}(?!\S)"
+    + r"|^[-*+]\s+"
+    + r"|^\d+\.\s+",
     flags=re.MULTILINE,
 )
 

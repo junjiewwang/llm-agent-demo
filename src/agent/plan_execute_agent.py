@@ -14,8 +14,11 @@
 - PlanExecuteAgent 额外提供：任务分解、步骤跟踪、Replan 能力
 """
 
-import time
-from typing import Optional, TYPE_CHECKING
+from __future__ import annotations
+
+from typing import Any, Callable, TYPE_CHECKING
+
+from typing_extensions import override
 
 from src.agent.base_agent import BaseAgent, OnEventCallback, WaitForConfirmation
 from src.agent.events import AgentEvent, AgentStoppedError, EventType
@@ -37,6 +40,7 @@ from src.tools.base_tool import ToolRegistry
 from src.utils.logger import logger
 
 if TYPE_CHECKING:
+    from opentelemetry.trace import Span
     from src.rag.knowledge_base import KnowledgeBase
     from src.skills.router import SkillRouter
 
@@ -91,43 +95,44 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         tool_registry: ToolRegistry,
         memory: ConversationMemory,
         context_builder: ContextBuilder,
-        vector_store: Optional[VectorStore] = None,
-        conversation_archive: Optional[ConversationArchive] = None,
-        session_summary: Optional[SessionSummary] = None,
-        knowledge_base: Optional["KnowledgeBase"] = None,
-        skill_router: Optional["SkillRouter"] = None,
-        env_adapter: Optional[EnvironmentAdapter] = None,
-        max_iterations: Optional[int] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        vector_store: VectorStore | None = None,
+        conversation_archive: ConversationArchive | None = None,
+        session_summary: SessionSummary | None = None,
+        knowledge_base: KnowledgeBase | None = None,
+        skill_router: SkillRouter | None = None,
+        env_adapter: EnvironmentAdapter | None = None,
+        max_iterations: int | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ):
         super().__init__(llm_client, tool_registry, memory)
-        self._context_builder = context_builder
-        self._vector_store = vector_store
-        self._conversation_archive = conversation_archive
-        self._session_summary = session_summary
-        self._knowledge_base = knowledge_base
-        self._skill_router = skill_router
-        self._env_adapter = env_adapter
-        self._max_iterations = max_iterations or settings.agent.max_iterations
-        self._temperature = temperature or settings.agent.temperature
-        self._step_temperature = settings.agent.step_temperature  # 步骤执行独立低温
-        self._max_tokens = max_tokens or settings.agent.max_tokens
-        self._last_metrics: Optional[RunMetrics] = None
+        self._context_builder: ContextBuilder = context_builder
+        self._vector_store: VectorStore | None = vector_store
+        self._conversation_archive: ConversationArchive | None = conversation_archive
+        self._session_summary: SessionSummary | None = session_summary
+        self._knowledge_base: KnowledgeBase | None = knowledge_base
+        self._skill_router: SkillRouter | None = skill_router
+        self._env_adapter: EnvironmentAdapter | None = env_adapter
+        self._max_iterations: int = max_iterations or settings.agent.max_iterations
+        self._temperature: float = temperature or settings.agent.temperature
+        self._step_temperature: float = settings.agent.step_temperature
+        self._max_tokens: int = max_tokens or settings.agent.max_tokens
+        self._last_metrics: RunMetrics | None = None
 
         # 每步子循环的最大迭代数（比主 Agent 少，避免单步耗时过长）
-        self._step_max_iterations = min(self._max_iterations, 10)
-        self._loop_detector = LoopDetector()
-        self._current_snapshot_pos: Optional[int] = None  # 当前步骤的 Scratchpad 快照位置
+        self._step_max_iterations: int = min(self._max_iterations, 10)
+        self._loop_detector: LoopDetector = LoopDetector()
+        self._current_snapshot_pos: int | None = None  # 当前步骤的 Scratchpad 快照位置
 
     @property
     def context_builder(self) -> ContextBuilder:
         return self._context_builder
 
     @property
-    def last_metrics(self) -> Optional[RunMetrics]:
+    def last_metrics(self) -> RunMetrics | None:
         return self._last_metrics
 
+    @override
     def run(
         self,
         user_input: str,
@@ -164,7 +169,8 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
 
     def _run_plan_execute(
         self, user_input: str, metrics: RunMetrics,
-        _emit, wait_for_confirmation: WaitForConfirmation = None,
+        _emit: Callable[[AgentEvent], None],
+        wait_for_confirmation: WaitForConfirmation = None,
     ) -> str:
         """Plan-Execute 核心流程。"""
 
@@ -259,8 +265,9 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
 
     def _execute_step(
         self, plan: Plan, step: PlanStep, metrics: RunMetrics,
-        _emit, wait_for_confirmation: WaitForConfirmation = None,
-    ) -> Optional[str]:
+        _emit: Callable[[AgentEvent], None],
+        wait_for_confirmation: WaitForConfirmation = None,
+    ) -> str | None:
         """执行计划中的单个步骤，复用 ReAct 子循环。
 
         采用 Scratchpad 架构实现步骤级上下文隔离：
@@ -491,7 +498,7 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         else:
             self._context_builder.set_skills([])
 
-    def _check_and_compress(self, _emit) -> None:
+    def _check_and_compress(self, _emit: Callable[[AgentEvent], None]) -> None:
         """检查并执行上下文压缩。"""
         estimate = self._context_builder.estimate_compression_needed(self._memory.messages)
         if not estimate:
@@ -508,7 +515,7 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         ))
 
     def _log_context_summary(
-        self, context_messages: list, tools_schema: Optional[list],
+        self, context_messages: list[Message], tools_schema: list[dict[str, Any]] | None,
         step_index: int, total_steps: int, iteration: int,
     ) -> None:
         """打印步骤 LLM 调用前的上下文摘要，用于调试和可观测性。"""
@@ -536,7 +543,7 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         logger.debug("步骤 {}/{} context_messages 详情:\n{}", step_index, total_steps,
                       "\n".join(msg_preview))
 
-    def _infer_expected_tools(self, step: PlanStep) -> Optional[list]:
+    def _infer_expected_tools(self, step: PlanStep) -> list[str] | None:
         """从步骤描述和 tool_hint 推断预期工具列表（用于 L3 偏离检测）。
 
         基于关键词匹配将步骤目标映射到可能需要的工具集合。
@@ -601,7 +608,7 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
         self._memory.add_assistant_message(response)
         return response.content or ""
 
-    def _try_replan(self, plan: Plan, _emit) -> Optional[list]:
+    def _try_replan(self, plan: Plan, _emit: Callable[[AgentEvent], None]) -> list[PlanStep] | None:
         """尝试重新规划剩余步骤。"""
         _emit(AgentEvent(
             type=EventType.REPLAN,
@@ -670,7 +677,8 @@ class PlanExecuteAgent(BaseAgent, ToolExecutorMixin):
 
     def _fallback_direct_answer(
         self, user_input: str, metrics: RunMetrics,
-        _emit, wait_for_confirmation: WaitForConfirmation = None,
+        _emit: Callable[[AgentEvent], None],
+        wait_for_confirmation: WaitForConfirmation = None,
     ) -> str:
         """计划生成失败时，回退为直接 ReAct 模式。"""
         from src.agent.react_agent import ReActAgent

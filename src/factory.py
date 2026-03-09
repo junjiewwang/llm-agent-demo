@@ -8,10 +8,12 @@
 - Conversation（每次新建对话）：ConversationMemory、ReActAgent
 """
 
+from __future__ import annotations
+
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+from typing import Any
 
 from src.agent import ReActAgent
 from src.agent.base_agent import BaseAgent
@@ -87,9 +89,9 @@ class Conversation:
     title: str
     memory: ConversationMemory
     agent: BaseAgent  # ReActAgent 或 PlanExecuteAgent
-    session_summary: Optional[SessionSummary] = None
+    session_summary: SessionSummary | None = None
     created_at: float = field(default_factory=time.time)
-    chat_history: List[dict] = field(default_factory=list)
+    chat_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -98,9 +100,9 @@ class SharedComponents:
 
     llm_client: OpenAIClient
     tool_registry: ToolRegistry
-    knowledge_base: Optional[KnowledgeBase] = None
-    skill_router: Optional[SkillRouter] = None
-    mcp_manager: Optional[MCPToolManager] = None
+    knowledge_base: KnowledgeBase | None = None
+    skill_router: SkillRouter | None = None
+    mcp_manager: MCPToolManager | None = None
 
 
 @dataclass
@@ -108,19 +110,19 @@ class TenantSession:
     """单个租户的会话，管理长期记忆和多个对话。"""
 
     tenant_id: str
-    vector_store: Optional[VectorStore]
-    conversation_archive: Optional[ConversationArchive] = None
-    governor: Optional[MemoryGovernor] = None
-    conversations: Dict[str, Conversation] = field(default_factory=dict)
-    active_conv_id: Optional[str] = None
+    vector_store: VectorStore | None
+    conversation_archive: ConversationArchive | None = None
+    governor: MemoryGovernor | None = None
+    conversations: dict[str, Conversation] = field(default_factory=dict)
+    active_conv_id: str | None = None
 
-    def get_active_conversation(self) -> Optional[Conversation]:
+    def get_active_conversation(self) -> Conversation | None:
         """获取当前活跃对话。"""
         if self.active_conv_id and self.active_conv_id in self.conversations:
             return self.conversations[self.active_conv_id]
         return None
 
-    def get_conversation_list(self) -> List[dict]:
+    def get_conversation_list(self) -> list[dict[str, Any]]:
         """返回对话列表（按创建时间倒序），用于 UI 展示。"""
         convs = sorted(
             self.conversations.values(),
@@ -142,16 +144,16 @@ class AgentComponents:
     llm_client: OpenAIClient
     memory: ConversationMemory
     tool_registry: ToolRegistry
-    agent: ReActAgent
-    vector_store: Optional[VectorStore] = None
-    knowledge_base: Optional[KnowledgeBase] = None
+    agent: BaseAgent
+    vector_store: VectorStore | None = None
+    knowledge_base: KnowledgeBase | None = None
 
 
 # ── 工厂函数 ──
 
 def create_tool_registry(
-    knowledge_base: Optional[KnowledgeBase],
-) -> tuple[ToolRegistry, Optional[MCPToolManager]]:
+    knowledge_base: KnowledgeBase | None,
+) -> tuple[ToolRegistry, MCPToolManager | None]:
     """创建并注册所有可用工具（含 MCP 外部工具）。
 
     Returns:
@@ -261,7 +263,7 @@ def _register_devops_tools(registry: ToolRegistry) -> None:
     )
 
 
-def _register_mcp_tools(registry: ToolRegistry) -> Optional[MCPToolManager]:
+def _register_mcp_tools(registry: ToolRegistry) -> MCPToolManager | None:
     """从 .mcp.json 发现 MCP 外部工具并注册到 ToolRegistry。
 
     单个 Server 连接失败不阻塞其他 Server 和整体启动流程。
@@ -353,10 +355,10 @@ def _log_feature_flags() -> None:
         f"  plan_execute     = {_flag(cfg.plan_execute_enabled)}",
         f"  policy           = {_flag(cfg.policy_enabled)}",
         f"  memory_governor  = {_flag(cfg.memory_governor_enabled)}"
-        f"  (interval={cfg.memory_governor_interval}s,"
-        f" ttl={cfg.memory_default_ttl_days}d,"
-        f" min_score={cfg.memory_min_value_score},"
-        f" merge_threshold={cfg.memory_merge_threshold})",
+        + f"  (interval={cfg.memory_governor_interval}s,"
+        + f" ttl={cfg.memory_default_ttl_days}d,"
+        + f" min_score={cfg.memory_min_value_score},"
+        + f" merge_threshold={cfg.memory_merge_threshold})",
         f"  env_adapter      = {_flag(cfg.env_adapter_enabled)}",
     ]
     logger.info("\n".join(lines))
@@ -370,7 +372,7 @@ def create_shared_components() -> SharedComponents:
     """
     llm_client = OpenAIClient()
 
-    knowledge_base: Optional[KnowledgeBase] = None
+    knowledge_base: KnowledgeBase | None = None
     try:
         knowledge_base = KnowledgeBase()
     except Exception as e:
@@ -394,9 +396,9 @@ def create_tenant_session(tenant_id: str) -> TenantSession:
     """为租户创建会话（包含独立的长期记忆、对话归档和可选的 Governor）。"""
     # ChromaDB collection name 要求 3-63 字符，[a-zA-Z0-9._-]，不能以 _ 结尾
     safe_id = tenant_id[:16] if tenant_id else uuid.uuid4().hex[:16]
-    vector_store: Optional[VectorStore] = None
-    governor: Optional[MemoryGovernor] = None
-    conversation_archive: Optional[ConversationArchive] = None
+    vector_store: VectorStore | None = None
+    governor: MemoryGovernor | None = None
+    conversation_archive: ConversationArchive | None = None
 
     try:
         vector_store = VectorStore(
@@ -435,15 +437,30 @@ def _create_agent(
     tenant: TenantSession,
     memory: ConversationMemory,
     context_builder: ContextBuilder,
-    session_summary: Optional[SessionSummary] = None,
-    env_adapter=None,
+    session_summary: SessionSummary | None = None,
+    env_adapter: EnvironmentAdapter | None = None,
 ) -> BaseAgent:
     """根据 feature flag 创建 ReActAgent 或 PlanExecuteAgent。
 
     共享相同的构造参数，唯一差异是 Agent 类型。
     plan_execute_enabled=True 时创建 PlanExecuteAgent，否则创建 ReActAgent。
     """
-    common_kwargs = dict(
+    if settings.agent.plan_execute_enabled:
+        logger.debug("创建 PlanExecuteAgent")
+        return PlanExecuteAgent(
+            llm_client=shared.llm_client,
+            tool_registry=shared.tool_registry,
+            memory=memory,
+            context_builder=context_builder,
+            vector_store=tenant.vector_store,
+            conversation_archive=tenant.conversation_archive,
+            session_summary=session_summary,
+            knowledge_base=shared.knowledge_base,
+            skill_router=shared.skill_router,
+            env_adapter=env_adapter,
+        )
+
+    return ReActAgent(
         llm_client=shared.llm_client,
         tool_registry=shared.tool_registry,
         memory=memory,
@@ -455,12 +472,6 @@ def _create_agent(
         skill_router=shared.skill_router,
         env_adapter=env_adapter,
     )
-
-    if settings.agent.plan_execute_enabled:
-        logger.debug("创建 PlanExecuteAgent")
-        return PlanExecuteAgent(**common_kwargs)
-
-    return ReActAgent(**common_kwargs)
 
 
 def create_conversation(
@@ -519,7 +530,7 @@ def create_conversation(
 def restore_conversation(
     shared: SharedComponents,
     tenant: TenantSession,
-    conv_data: dict,
+    conv_data: dict[str, Any],
     max_memory_tokens: int = 8000,
 ) -> Conversation:
     """从持久化数据恢复一个对话。

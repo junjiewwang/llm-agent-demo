@@ -19,7 +19,9 @@ Scratchpad 机制：
     这将步骤执行的 Token 消耗从 O(k²) 降低到 O(k)。
 """
 
-from typing import Optional, List, TYPE_CHECKING
+from __future__ import annotations
+
+from typing import Any, TYPE_CHECKING
 
 from src.llm.base_client import Message, Role
 from src.memory.token_counter import TokenCounter
@@ -47,7 +49,7 @@ class ConversationMemory:
 
     def __init__(
         self,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         max_tokens: int = 8000,
         max_messages: int = 40,
         model: str = "gpt-4o",
@@ -59,14 +61,14 @@ class ConversationMemory:
             max_messages: 最大保留消息数（不含 system prompt），作为硬性上限。
             model: 用于 Token 计数的模型名称。
         """
-        self._messages: List[Message] = []
-        self._system_prompt_count = 0
-        self._max_tokens = max_tokens
-        self._max_messages = max_messages
-        self._token_counter = TokenCounter(model=model)
-        self._llm_client: Optional["BaseLLMClient"] = None
+        self._messages: list[Message] = []
+        self._system_prompt_count: int = 0
+        self._max_tokens: int = max_tokens
+        self._max_messages: int = max_messages
+        self._token_counter: TokenCounter = TokenCounter(model=model)
+        self._llm_client: BaseLLMClient | None = None
         self._compression_count: int = 0  # 累计压缩次数
-        self._active_snapshot_pos: Optional[int] = None  # 活跃的 Scratchpad 快照位置
+        self._active_snapshot_pos: int | None = None  # 活跃的 Scratchpad 快照位置
 
         if system_prompt:
             self._messages.append(Message(role=Role.SYSTEM, content=system_prompt))
@@ -77,9 +79,14 @@ class ConversationMemory:
         self._llm_client = client
 
     @property
-    def messages(self) -> List[Message]:
+    def messages(self) -> list[Message]:
         """返回当前所有消息的副本。"""
         return list(self._messages)
+
+    @property
+    def system_prompt_count(self) -> int:
+        """System Prompt 消息数量（通常为 0 或 1）。"""
+        return self._system_prompt_count
 
     @property
     def token_count(self) -> int:
@@ -87,7 +94,7 @@ class ConversationMemory:
         return self._token_counter.count_messages(self._messages)
 
     @property
-    def active_snapshot_pos(self) -> Optional[int]:
+    def active_snapshot_pos(self) -> int | None:
         """当前活跃的 Scratchpad 快照位置（已同步 _smart_truncate 的偏移）。"""
         return self._active_snapshot_pos
 
@@ -173,7 +180,7 @@ class ConversationMemory:
                      removed_count, len(self._messages))
         return removed_count
 
-    def messages_from(self, snapshot_pos: int) -> List[Message]:
+    def messages_from(self, snapshot_pos: int) -> list[Message]:
         """返回 System Prompt + 指定位置之后的消息（Scratchpad 局部视图）。
 
         用于 Plan-Execute 执行器的上下文隔离：只给 LLM 看当前步骤
@@ -213,21 +220,21 @@ class ConversationMemory:
 
     # ── 序列化/反序列化（用于会话持久化） ──
 
-    def serialize(self) -> dict:
+    def serialize(self) -> dict[str, Any]:
         """将对话记忆序列化为可 JSON 化的字典。"""
         return {
             "messages": [msg.model_dump(mode="json") for msg in self._messages],
             "system_prompt_count": self._system_prompt_count,
         }
 
-    def restore_from(self, data: dict) -> None:
+    def restore_from(self, data: dict[str, Any]) -> None:
         """从序列化数据恢复对话记忆（替换当前消息列表）。
 
         Args:
             data: serialize() 生成的字典，包含 messages 和 system_prompt_count。
         """
         raw_messages = data.get("messages", [])
-        restored: List[Message] = []
+        restored: list[Message] = []
         for item in raw_messages:
             if "role" in item and isinstance(item["role"], str):
                 item["role"] = Role(item["role"])
@@ -336,7 +343,7 @@ class ConversationMemory:
             current_tokens, new_tokens, self._compression_count,
         )
 
-    def _summarize(self, messages: List[Message]) -> Optional[str]:
+    def _summarize(self, messages: list[Message]) -> str | None:
         """使用 LLM 对旧消息进行结构化摘要压缩。
 
         相比简单的"概括为几句话"，结构化摘要会分类保留关键信息：
