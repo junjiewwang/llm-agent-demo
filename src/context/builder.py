@@ -338,8 +338,10 @@ class ContextBuilder:
     def set_memory(self, results: List[dict], relevance_threshold: float = 0.8) -> "ContextBuilder":
         """设置长期记忆检索结果（临时注入，不持久化）。
 
+        注入时标注采集时间和时效性提示，帮助 LLM 判断数据新鲜度。
+
         Args:
-            results: 长期记忆检索结果列表，每项含 'text' 和 'distance'。
+            results: 长期记忆检索结果列表，每项含 'text', 'distance', 可选 'metadata'。
             relevance_threshold: 相关度阈值（cosine distance），低于此值才认为相关。
         """
         if not results:
@@ -360,14 +362,36 @@ class ContextBuilder:
             self._memory_messages = []
             return self
 
-        memory_text = "\n".join(f"- {r['text']}" for r in unique_results)
+        # A-2: 每条记忆附带采集时间（从 metadata.collected_at 或文本中的日期前缀提取）
+        memory_lines = []
+        for r in unique_results:
+            text = r["text"]
+            metadata = r.get("metadata", {})
+            collected_at = metadata.get("collected_at")
+            if collected_at:
+                from datetime import datetime as _dt
+                try:
+                    date_str = _dt.fromtimestamp(collected_at).strftime("%Y-%m-%d")
+                    memory_lines.append(f"- (采集于 {date_str}) {text}")
+                except (OSError, ValueError):
+                    memory_lines.append(f"- {text}")
+            else:
+                memory_lines.append(f"- {text}")
+
+        memory_text = "\n".join(memory_lines)
+        # A-2: 时效性警告头部
+        header = (
+            "[相关历史记忆]\n"
+            "⚠️ 以下为历史记忆，仅供参考。对于状态、列表、实时数据等时变信息，"
+            "请务必调用工具获取最新数据，不要直接使用历史记忆作为最终答案。"
+        )
         self._memory_messages = [
             Message(
                 role=Role.SYSTEM,
-                content=f"[相关历史记忆]\n{memory_text}",
+                content=f"{header}\n{memory_text}",
             )
         ]
-        logger.debug("ContextBuilder: 设置 {} 条长期记忆（去重后）", len(unique_results))
+        logger.debug("ContextBuilder: 设置 {} 条长期记忆（去重后，含时效性提示）", len(unique_results))
         return self
 
     def set_archive(self, results: List[dict], relevance_threshold: float = 0.8) -> "ContextBuilder":

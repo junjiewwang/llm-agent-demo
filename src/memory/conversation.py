@@ -91,6 +91,21 @@ class ConversationMemory:
         """当前活跃的 Scratchpad 快照位置（已同步 _smart_truncate 的偏移）。"""
         return self._active_snapshot_pos
 
+    def update_system_prompt(self, new_prompt: str) -> None:
+        """更新 System Prompt 为最新版本。
+
+        用于恢复旧对话时，将持久化中保存的旧 system prompt 替换为
+        当前最新版本，确保 System Prompt 迭代（如新增规则）对旧对话也能生效。
+
+        如果当前没有 system prompt，则新增一条。
+        """
+        if self._system_prompt_count > 0:
+            self._messages[0] = Message(role=Role.SYSTEM, content=new_prompt)
+        else:
+            self._messages.insert(0, Message(role=Role.SYSTEM, content=new_prompt))
+            self._system_prompt_count = 1
+        logger.debug("System Prompt 已更新（{}字符）", len(new_prompt))
+
     def add_message(self, message: Message) -> None:
         """添加消息并执行智能截断。"""
         self._messages.append(message)

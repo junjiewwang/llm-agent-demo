@@ -309,7 +309,7 @@ class ToolExecutorMixin:
                 max_iterations=metrics.max_iterations,
                 tool_name=parsed.func_name,
                 tool_args=parsed.func_args,
-                tool_result_preview=message_content[:150],
+                tool_result_preview=message_content[:500],
                 duration_ms=duration_ms,
                 success=result.success,
                 parallel_total=parallel_total,

@@ -560,7 +560,9 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         """将对话中的关键事实提取并存储到长期记忆。
 
         使用 LLM 从 Q&A 中提取值得记住的关键事实（偏好、结论、数据），
-        而非存储原始的"用户问/回答"拼接，提高记忆质量和检索精度。
+        并根据时变性分类设置不同的 TTL：
+        - 时变数据（状态、列表等）：TTL = 1 天
+        - 稳定数据（偏好、配置等）：使用默认 TTL
         """
         if not self._vector_store:
             return
@@ -568,46 +570,89 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
         if len(user_input.strip()) < 5 or len(answer.strip()) < 10:
             return
 
-        # 尝试用 LLM 提取关键事实
-        key_facts = self._extract_key_facts(user_input, answer, metrics)
-        if key_facts:
+        from datetime import datetime
+
+        # 尝试用 LLM 提取关键事实（含时变性判断）
+        result = self._extract_key_facts(user_input, answer, metrics)
+        if result:
+            facts = result["facts"]
+            volatile = result["volatile"]
+
+            # A-1: 自动添加日期前缀
+            date_prefix = datetime.now().strftime("[%Y-%m-%d]")
+            facts_with_date = f"{date_prefix} {facts}"
+
+            # A-3: 时变记忆设置短 TTL（1 天）
+            metadata = {
+                "type": "key_facts",
+                "question": user_input[:200],
+                "volatile": volatile,
+                "collected_at": time.time(),
+            }
+            if volatile:
+                metadata["ttl"] = time.time() + 86400  # 1 天后过期
+                logger.debug("时变记忆（TTL=1天）已存入: {}", facts_with_date[:100])
+            else:
+                logger.debug("稳定记忆已存入: {}", facts_with_date[:100])
+
             self._vector_store.add(
-                text=key_facts,
-                metadata={"type": "key_facts", "question": user_input[:200]},
+                text=facts_with_date,
+                metadata=metadata,
             )
-            logger.debug("结构化记忆已存入长期记忆: {}", key_facts[:100])
         else:
             # LLM 提取失败时回退到简单存储，清洗格式装饰以减少噪声
             clean_answer = _clean_text_for_memory(answer[:300])
-            summary = f"用户问: {user_input[:200]} | 回答: {clean_answer}"
+            date_prefix = datetime.now().strftime("[%Y-%m-%d]")
+            summary = f"{date_prefix} 用户问: {user_input[:200]} | 回答: {clean_answer}"
             self._vector_store.add(
                 text=summary,
-                metadata={"type": "conversation", "question": user_input[:200]},
+                metadata={
+                    "type": "conversation",
+                    "question": user_input[:200],
+                    "volatile": False,
+                    "collected_at": time.time(),
+                },
             )
             logger.debug("对话已存入长期记忆（回退模式）")
 
     def _extract_key_facts(self, user_input: str, answer: str,
-                           metrics: Optional[RunMetrics] = None) -> Optional[str]:
-        """使用 LLM 从对话中提取值得长期记住的关键事实。
+                           metrics: Optional[RunMetrics] = None) -> Optional[dict]:
+        """使用 LLM 从对话中提取值得长期记住的关键事实，并判断时变性。
 
         Returns:
-            提取的关键事实文本；如果对话不值得记忆或提取失败，返回 None。
+            dict with keys:
+                - "facts": 提取的关键事实文本
+                - "volatile": 是否为时变数据（如状态、列表、实时指标等）
+            如果对话不值得记忆或提取失败，返回 None。
         """
         try:
             extract_prompt = [
                 Message(
                     role=Role.SYSTEM,
                     content=(
-                        "从以下对话中提取值得长期记住的关键事实。\n\n"
+                        "从以下对话中提取值得长期记住的关键事实，并判断数据的时变性。\n\n"
                         "提取规则：\n"
                         "1. 只提取客观事实、用户偏好、明确结论、重要数据\n"
                         "2. 跳过寒暄、闲聊、重复的常识性问答\n"
                         "3. 用简洁的纯文本陈述句输出，每条事实一行，最多 3 条\n"
                         "4. 不要使用 Markdown 格式、表情符号或装饰性符号\n"
                         '5. 如果对话没有值得记忆的关键事实，只输出"无"\n\n'
-                        "示例输出：\n"
+                        "时变性判断规则：\n"
+                        "- 时变数据：任务状态、工单状态、服务状态、资源用量、列表数据、"
+                        "实时指标、告警信息等可能随时间变化的数据\n"
+                        "- 稳定数据：用户偏好、配置信息、架构设计、人员分工、项目名称等"
+                        "短期内不会变化的事实\n\n"
+                        "输出格式（严格遵守）：\n"
+                        "第一行输出 VOLATILE 或 STABLE 表示时变性\n"
+                        "后续行输出提取的关键事实\n\n"
+                        "示例输出 1：\n"
+                        "STABLE\n"
                         "用户偏好使用 Python 进行数据分析\n"
-                        "项目部署在 3 个 Kubernetes namespace 中"
+                        "项目部署在 3 个 Kubernetes namespace 中\n\n"
+                        "示例输出 2：\n"
+                        "VOLATILE\n"
+                        "TAPD 需求 #12345 当前状态为开发中\n"
+                        "用户有 3 个待办缺陷未处理"
                     ),
                 ),
                 Message(
@@ -629,7 +674,22 @@ class ReActAgent(BaseAgent, ToolExecutorMixin):
             if not result or result == "无":
                 logger.debug("LLM 判断对话不含值得记忆的关键事实")
                 return None
-            return result
+
+            # 解析时变性标签和事实内容
+            lines = result.split("\n", 1)
+            first_line = lines[0].strip().upper()
+            volatile = first_line == "VOLATILE"
+            facts = lines[1].strip() if len(lines) > 1 else first_line
+
+            # 如果第一行不是标签（兼容旧格式），将整个结果作为事实
+            if first_line not in ("VOLATILE", "STABLE"):
+                facts = result
+                volatile = False
+
+            if not facts or facts == "无":
+                return None
+
+            return {"facts": facts, "volatile": volatile}
         except Exception as e:
             logger.warning("关键事实提取失败: {}", e)
             return None

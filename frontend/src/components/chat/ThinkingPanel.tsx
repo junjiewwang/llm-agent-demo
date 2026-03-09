@@ -168,18 +168,40 @@ function getToolMeta(name: string): ToolMeta {
   return DEFAULT_TOOL_META
 }
 
+/** MCP 工具参数中有意义的描述字段，按优先级排列 */
+const MCP_DESCRIPTION_KEYS = ['task_description', 'query', 'tool_name', 'description', 'name', 'message']
+
+/**
+ * 从 MCP 工具参数中提取最有意义的描述文本。
+ * 返回 { text, key } 或 null。
+ */
+function extractMCPDescription(args: Record<string, unknown>): { text: string; key: string } | null {
+  for (const key of MCP_DESCRIPTION_KEYS) {
+    const val = args[key]
+    if (typeof val === 'string' && val.trim()) {
+      return { text: val.trim(), key }
+    }
+  }
+  // fallback: 取第一个字符串类型的参数
+  for (const [key, val] of Object.entries(args)) {
+    if (typeof val === 'string' && val.trim()) {
+      return { text: val.trim(), key }
+    }
+  }
+  return null
+}
+
 /** 从工具参数中提取有意义的标题文本 */
 function getToolTitle(toolName: string, args: Record<string, unknown>): string {
-  // MCP 工具：展示 server:tool + 首参数预览
+  // MCP 工具：展示 server:tool → 有意义的描述
   const mcp = parseMCPToolName(toolName)
   if (mcp) {
-    const entries = Object.entries(args)
-    if (entries.length > 0) {
-      const val = typeof entries[0][1] === 'string' ? entries[0][1] : JSON.stringify(entries[0][1])
-      const preview = val.length > 80 ? val.slice(0, 80) + '...' : val
-      return `${mcp.tool} → ${preview}`
+    const desc = extractMCPDescription(args)
+    if (desc) {
+      const preview = desc.text.length > 80 ? desc.text.slice(0, 80) + '...' : desc.text
+      return `${mcp.server}:${mcp.tool} → ${preview}`
     }
-    return mcp.tool
+    return `${mcp.server}:${mcp.tool}`
   }
 
   switch (toolName) {
@@ -208,6 +230,12 @@ function getToolTitle(toolName: string, args: Record<string, unknown>): string {
 
 /** 返回已在标题中展示的参数 key 集合，展开时跳过这些 key */
 function getTitleKeys(toolName: string, args: Record<string, unknown>): Set<string> {
+  // MCP 工具：排除已在标题中展示的描述字段
+  if (toolName.startsWith('mcp__')) {
+    const desc = extractMCPDescription(args)
+    return desc ? new Set([desc.key]) : new Set()
+  }
+
   switch (toolName) {
     case 'execute_command': return new Set(['command'])
     case 'curl': return new Set(['method', 'url'])
@@ -233,7 +261,10 @@ function ToolCard({
   resultEvent?: ToolResultEvent
 }) {
   const [expanded, setExpanded] = useState(false)
+  const [resultFullView, setResultFullView] = useState(false)
   const [copied, setCopied] = useState(false)
+  const resultRef = useRef<HTMLPreElement>(null)
+  const [isOverflowing, setIsOverflowing] = useState(false)
   const meta = getToolMeta(callEvent.tool_name)
   const mcpInfo = parseMCPToolName(callEvent.tool_name)
   const isRunning = !resultEvent
@@ -245,6 +276,13 @@ function ToolCard({
   const titleKeys = getTitleKeys(callEvent.tool_name, callEvent.tool_args)
   const remainingArgs = Object.entries(callEvent.tool_args).filter(([key]) => !titleKeys.has(key))
   const hasExpandContent = remainingArgs.length > 0 || !!resultEvent
+
+  // 检测结果内容是否溢出
+  useEffect(() => {
+    if (resultRef.current && !resultFullView) {
+      setIsOverflowing(resultRef.current.scrollHeight > resultRef.current.clientHeight)
+    }
+  }, [expanded, resultEvent, resultFullView])
 
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -339,9 +377,24 @@ function ToolCard({
             </div>
           )}
           {resultEvent && (
-            <pre className="mx-2 my-1.5 px-2 py-1.5 rounded bg-gray-50 dark:bg-gray-900/60 text-[10px] font-mono text-gray-600 dark:text-gray-300 max-h-48 overflow-y-auto whitespace-pre-wrap break-all">
-              {resultEvent.tool_result_preview || '(无输出)'}
-            </pre>
+            <div className="mx-2 my-1.5">
+              <pre
+                ref={resultRef}
+                className={`px-2 py-1.5 rounded bg-gray-50 dark:bg-gray-900/60 text-[10px] font-mono text-gray-600 dark:text-gray-300 overflow-y-auto whitespace-pre-wrap break-all ${
+                  resultFullView ? 'max-h-[80vh]' : 'max-h-64'
+                }`}
+              >
+                {resultEvent.tool_result_preview || '(无输出)'}
+              </pre>
+              {(isOverflowing || resultFullView) && (
+                <button
+                  onClick={() => setResultFullView(!resultFullView)}
+                  className="mt-1 text-[10px] text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300 transition-colors"
+                >
+                  {resultFullView ? '▲ 收起' : '▼ 查看全部'}
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
