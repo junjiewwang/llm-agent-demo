@@ -878,6 +878,7 @@ class ContextBuilder:
             history_msgs, settings.agent.recent_window_size,
         )
         # Session Summary 注入 History Zone 头部（逻辑上是 History 的全局概要）
+        count = self._token_counter.count_messages
         session_summary_tokens = 0
         if self._session_summary:
             session_summary_tokens = count([self._session_summary])
@@ -885,7 +886,6 @@ class ContextBuilder:
         result.extend(history_msgs)
 
         # 各 Zone Token 统计
-        count = self._token_counter.count_messages
         system_tokens = count(system_msgs)
         env_tokens = count([env_msg]) if env_msg else 0
         history_tokens = count(history_msgs)

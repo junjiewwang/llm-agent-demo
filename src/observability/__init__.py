@@ -103,20 +103,35 @@ def _create_otlp_exporters(otel_conf: OtelSettings) -> tuple[Any, Any]:
     trace_mod = importlib.import_module(f"{base_module}.trace_exporter")
     metric_mod = importlib.import_module(f"{base_module}.metric_exporter")
 
-    exporter_kwargs: dict[str, Any] = {"endpoint": otel_conf.exporter_endpoint}
+    base_endpoint = otel_conf.exporter_endpoint.rstrip("/")
+
+    # 鉴权 headers
+    headers = _parse_headers(otel_conf.exporter_headers)
+
+    # HTTP 协议需要为不同信号构造带路径的 endpoint（SDK 不会自动追加）
+    # gRPC 协议使用同一个 endpoint
+    if protocol == "http":
+        trace_endpoint = f"{base_endpoint}/v1/traces"
+        metric_endpoint = f"{base_endpoint}/v1/metrics"
+    else:
+        trace_endpoint = base_endpoint
+        metric_endpoint = base_endpoint
+
+    span_kwargs: dict[str, Any] = {"endpoint": trace_endpoint}
+    metric_kwargs: dict[str, Any] = {"endpoint": metric_endpoint}
 
     # gRPC: insecure 根据 endpoint scheme 自动判断
     if protocol == "grpc":
         is_https = otel_conf.exporter_endpoint.startswith("https://")
-        exporter_kwargs["insecure"] = not is_https
+        span_kwargs["insecure"] = not is_https
+        metric_kwargs["insecure"] = not is_https
 
-    # 鉴权 headers
-    headers = _parse_headers(otel_conf.exporter_headers)
     if headers:
-        exporter_kwargs["headers"] = headers
+        span_kwargs["headers"] = headers
+        metric_kwargs["headers"] = headers
 
-    span_exporter = trace_mod.OTLPSpanExporter(**exporter_kwargs)
-    metric_exporter = metric_mod.OTLPMetricExporter(**exporter_kwargs)
+    span_exporter = trace_mod.OTLPSpanExporter(**span_kwargs)
+    metric_exporter = metric_mod.OTLPMetricExporter(**metric_kwargs)
 
     return span_exporter, metric_exporter
 
